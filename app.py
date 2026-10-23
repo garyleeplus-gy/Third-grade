@@ -21,27 +21,53 @@ st.set_page_config(
 )
 
 DB_PATH = "science_persistent_store.db"
-PARSER_VERSION = "4.0"  # 升級至支援四科與純填空輸入版本
+PARSER_VERSION = "4.1"  # 自動清除多餘數學符號並升級資料庫
 SUBJECT_LIST = ["🌿 自然", "🌏 社會", "🔢 數學", "📘 國語"]
 
 
 # ==========================================
-# 1. 基礎文字清理與 HTML/表格工具函式
+# 1. 基礎文字與數學符號清理工具函式
 # ==========================================
+def clean_math_symbols(text: str) -> str:
+    """清除多餘的 LaTeX 符號 ($、\\times、\\text、imes、ext) 並轉為國小標準數學符號"""
+    if not text:
+        return ""
+    s = str(text)
+    # 修正因 \t 跳脫字元產生的 imes 與 ext
+    s = re.sub(r'[\t\\]*imes\b', ' × ', s)
+    s = re.sub(r'\\times\b', ' × ', s)
+    s = re.sub(r'\\div\b', ' ÷ ', s)
+    s = re.sub(r'\\cdot\b', '、', s)
+    s = re.sub(r'[\t\\]*ext\{([^}]*)\}', r'\1', s)
+    s = re.sub(r'\\boxed\{([^}]*)\}', r'(\1)', s)
+    s = re.sub(r'\\frac\{([^}]*)\}\{([^}]*)\}', r'\1/\2', s)
+    # 移除包夾在算式兩側的 $ 符號
+    s = s.replace('$', '')
+    # 修正多重空白
+    s = re.sub(r' {2,}', ' ', s)
+    return s.strip()
+
+
 def clean_cite(text: str) -> str:
-    """移除來源標記字串以維持畫面整潔"""
-    return re.sub(r'\s*\[cite:\s*[\d,\s\-]+\]', '', str(text))
+    """移除來源標記與多餘數學符號以維持畫面整潔"""
+    s = re.sub(r'\s*\[cite:\s*[\d,\s\-]+\]', '', str(text))
+    return clean_math_symbols(s)
 
 
 def clean_pdf_text(raw_text: str) -> str:
-    """清除 PDF 內嵌注音符號與浮水印雜訊"""
+    """清除 PDF 內嵌注音符號、浮水印與數學 OCR 雜訊"""
     if not raw_text:
         return ""
+    # 移除緊跟在中文字後的注音符號與聲調
     cleaned = re.sub(r'(?<=[\u4e00-\u9fff])[\u3105-\u3129\u02CA\u02C7\u02CB\u02D9ˊˇˋ˙]+', '', str(raw_text))
+    # 移除獨立成串的注音拼音與聲調（保留單獨作為代號的 ㄅㄆㄇㄈ）
+    cleaned = re.sub(r'[\u3105-\u3129]{2,}[\u02CA\u02C7\u02CB\u02D9ˊˇˋ˙]*', '', cleaned)
     cleaned = re.sub(r'xyz88\.\w+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'有著作權.*?必究\s*\d*', '', cleaned)
-    cleaned = re.sub(r'教師用書|貼心伴隨|敬請賜教', '', cleaned)
-    return cleaned
+    cleaned = re.sub(r'教師用書|貼心伴隨|敬請賜教|敬請|賜教', '', cleaned)
+    # 修正南一數學 PDF 中常將數字「1」誤認成直線「|」或「I」的情況
+    cleaned = re.sub(r'[|｜I](?=[個張盒瓶桶包袋枝條塊份雙打箱公毫平頂顆朵隻臺件元次天週星期年])', '1', cleaned)
+    return clean_math_symbols(cleaned)
 
 
 def detect_subject_from_name(name: str) -> str:
@@ -475,12 +501,10 @@ div.stButton > button, div[data-testid="stFormSubmitButton"] > button {{
 
 
 # ==========================================
-# 4. 修正版連連看 SVG 畫線元件（無縮排，100% 渲染圖形不變代碼）
+# 4. 連連看 SVG 畫線元件（無縮排，100% 渲染圖形）
 # ==========================================
 def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, correct_pairs: dict = None, show_grading: bool = False):
-    """
-    繪製連連看左右配對與彩色連線 SVG（完全消除縮排，避免被 Markdown 當成程式碼區塊）
-    """
+    """繪製連連看左右配對與彩色連線 SVG"""
     n_rows = max(len(left_items), len(right_items))
     row_h = 68
     svg_h = n_rows * row_h + 28
@@ -557,7 +581,6 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
             '</div>'
         )
 
-    # 關鍵：所有 HTML 標籤頂格無縮排，確保不會被 Markdown 解析為程式碼區塊
     svg_html = (
         f'<div style="width:100%; overflow-x:auto; background:#ffffff; border:2px solid #cbd5e1; border-radius:12px; margin:8px 0;">'
         f'{legend_html}'
@@ -586,7 +609,7 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
 
 
 # ==========================================
-# 5. 四大科目完整《重點複習》知識庫（自然、社會、數學、國語）
+# 5. 四大科目完整《重點複習》知識庫（無任何多餘符號）
 # ==========================================
 SUBJECT_REVIEW_DATA = {
     "🌿 自然": {
@@ -935,17 +958,17 @@ SUBJECT_REVIEW_DATA = {
                 "第2單元：四位數的加減": {
                     "points": [
                         "① 直式加法（進位）：將個位、十位、百位、千位對齊，由個位開始相加，滿 10 就向高一位【進 1】。",
-                        "② 直式減法（連續退位）：各位數對齊由個位開始減，不夠減時向高一位【借 1 換成 10】再減（例如 $4005 - 3892 = 113$、$3000 - 1357 = 1643$）。",
-                        "③ 加減估算：把數字看成最接近的【幾千】來估算（例如 $4890 + 980$ 約為 $5000 + 1000 = 6000$，最少要拿出【6】張千元鈔票才夠）。"
+                        "② 直式減法（連續退位）：各位數對齊由個位開始減，不夠減時向高一位【借 1 換成 10】再減（例如：4005 － 3892 ＝ 【113】、3000 － 1357 ＝ 【1643】）。",
+                        "③ 加減估算：把數字看成最接近的【幾千】來估算（例如：4890 ＋ 980 約為 5000 ＋ 1000 ＝ 6000，最少要拿出【6】張千元鈔票才夠）。"
                     ],
                     "tables": [],
                     "experiments": []
                 },
                 "第3單元：乘法": {
                     "points": [
-                        "① 整十、整百乘以一位數：先算非 0 數字相乘，再於末尾補上對應個數的 0（例如 $6 \times 9 = 54$ ➔ $60 \times 9 = 540$ ➔ $600 \times 9 = 5400$）。",
-                        "② 二、三位數乘以一位數直式：用乘數依序乘以被乘數的【個位、十位、百位】，有進位時記在高一位再相加（例如 $375 \times 8 = 3000$、$625 \times 8 = 5000$）。",
-                        "③ 乘法估算：先找出被乘數最接近幾百再相乘（例如一隻公仔賣 399 元，買 9 隻約花 $400 \times 9 = 3600$ 元）。"
+                        "① 整十、整百乘以一位數：先算非 0 數字相乘，再於末尾補上對應個數的 0（例如：6 × 9 ＝ 54 ➔ 60 × 9 ＝ 【540】 ➔ 600 × 9 ＝ 【5400】）。",
+                        "② 二、三位數乘以一位數直式：用乘數依序乘以被乘數的【個位、十位、百位】，有進位時記在高一位再相加（例如：375 × 8 ＝ 【3000】、625 × 8 ＝ 【5000】）。",
+                        "③ 乘法估算：先找出被乘數最接近幾百再相乘（例如：一隻公仔賣 399 元，買 9 隻約花 400 × 9 ＝ 【3600】元）。"
                     ],
                     "tables": [],
                     "experiments": []
@@ -958,7 +981,7 @@ SUBJECT_REVIEW_DATA = {
                 "第4單元：幾毫米 (mm)": {
                     "points": [
                         "① 長度單位換算：尺上 1 小格是 1【毫米 (mm)】；1 公分 (cm) ＝【10】毫米 (mm)；1 公尺 (m) ＝ 100 公分 ＝【1000】毫米 (mm)。",
-                        "② 複名數換算與計算：例如 $1\text{ m }47\text{ cm} = 1470\text{ mm}$；$5006\text{ mm} = 5\text{ m }6\text{ mm}$。做公分與毫米加減時，滿 10 毫米進為 1 公分，不夠減時借 1 公分換成 10 毫米。"
+                        "② 複名數換算與計算：例如 1 公尺 47 公分（1 m 47 cm）＝【1470】毫米 (mm)；5006 毫米 (mm) ＝【5】公尺 (m)【6】毫米 (mm)。做公分與毫米加減時，滿 10 毫米進為 1 公分，不夠減時借 1 公分換成 10 毫米。"
                     ],
                     "tables": [],
                     "experiments": []
@@ -975,7 +998,7 @@ SUBJECT_REVIEW_DATA = {
                 "第6單元：除法": {
                     "points": [
                         "① 除法與餘數：【被除數 ÷ 除數 ＝ 商 … 餘數】，利用九九乘法表求商，且【餘數一定要小於除數】（餘數為 0 代表【整除】）。",
-                        "② 0 和 1 的除法規律：$a \div a = 1$、$0 \div a = 0$、$a \div 1 = a$。",
+                        "② 0 和 1 的除法規律：任何數除以自己等於 1（如 8 ÷ 8 ＝ 【1】）；0 除以任何數等於 0（如 0 ÷ 7 ＝ 【0】）；任何數除以 1 等於自己（如 9 ÷ 1 ＝ 【9】）。",
                         "③ 【偶數（雙數）】與【奇數（單數）】：能被 2 整除（個位數為 0、2、4、6、8）的數稱為【偶數】；不能被 2 整除（個位數為 1、3、5、7、9）的數稱為【奇數】。"
                     ],
                     "tables": [],
@@ -989,7 +1012,7 @@ SUBJECT_REVIEW_DATA = {
                 "第7單元：公升 (L) 和毫升 (mL)": {
                     "points": [
                         "① 容量單位換算：1 公升 (L) ＝【1000】毫升 (mL)。1 瓶養樂多（乳酸飲料）約【100 毫升】，家庭號鮮奶約 2【公升】。",
-                        "② 複名數換算與計算：例如 5 公升 8 毫升 ＝【5008】毫升；2 公升 － 670 毫升 ＝ $2000 - 670 =$【1330】毫升。"
+                        "② 複名數換算與計算：例如 5 公升 8 毫升 ＝【5008】毫升；2 公升 － 670 毫升 ＝ 2000 － 670 ＝【1330】毫升。"
                     ],
                     "tables": [],
                     "experiments": []
@@ -997,7 +1020,7 @@ SUBJECT_REVIEW_DATA = {
                 "第8單元：分數": {
                     "points": [
                         "① 分母與分子：分數橫線下的數叫作【分母】（表示被平分成幾份），橫線上的數叫作【分子】（表示其中的幾份），例如「十分之七」記作【7/10】。",
-                        "② 單位分數的累加：只有【分子】會增加，分母保持不變；當分子和分母一樣大時，值等於【1】（例如 $1 = 6/6 = 8/8 = 10/10 = 12/12$）。"
+                        "② 單位分數的累加：只有【分子】會增加，分母保持不變；當分子和分母一樣大時，值等於【1】（例如：1 ＝ 6/6 ＝ 8/8 ＝ 10/10 ＝ 12/12）。"
                     ],
                     "tables": [],
                     "experiments": []
@@ -1234,10 +1257,10 @@ DEFAULT_QUIZ_BANK = [
             {"label": "(1) 6個千、3個十和4個一合起來是多少？", "ans": "6034"},
             {"label": "(2) 用 2、3、5、0 組成一個四位數（數字不重複），最大的數是多少？", "ans": "5320"},
             {"label": "(3) 用 2、3、5、0 組成一個四位數（數字不重複），最小的數是多少？", "ans": "2035"},
-            {"label": "(4) 4005 - 3892 = ？", "ans": "113"},
-            {"label": "(5) 3000 - 1357 = ？", "ans": "1643"},
-            {"label": "(6) 375 × 8 = ？", "ans": "3000"},
-            {"label": "(7) 704 × 7 = ？", "ans": "4928"}
+            {"label": "(4) 4005 － 3892 ＝ ？", "ans": "113"},
+            {"label": "(5) 3000 － 1357 ＝ ？", "ans": "1643"},
+            {"label": "(6) 375 × 8 ＝ ？", "ans": "3000"},
+            {"label": "(7) 704 × 7 ＝ ？", "ans": "4928"}
         ],
         "exp": "(1) 6034；(2) 5320；(3) 2035；(4) 113；(5) 1643；(6) 3000；(7) 4928。"
     },
@@ -1253,7 +1276,7 @@ DEFAULT_QUIZ_BANK = [
             {"label": "(6) 1 盒果凍有 15 個，14/15 盒果凍有幾個？", "ans": "14"},
             {"label": "(7) 要畫一個「直徑 6 公分」的圓，要將圓規兩端拉開到幾公分？", "ans": "3"}
         ],
-        "exp": "(1) 3200毫米；(2) 邊長縮短角的大小不變(會)；(3)(4) 38÷8=4…6；(5) 5008毫升；(6) 14個；(7) 圓規張開距離是半徑，6÷2=3公分。"
+        "exp": "(1) 3200毫米；(2) 邊長縮短角的大小不變(會)；(3)(4) 38 ÷ 8 ＝ 4 … 6；(5) 5008毫升；(6) 14個；(7) 圓規張開距離是半徑，6 ÷ 2 ＝ 3公分。"
     },
 
     # ==================== 📘 國語 ====================
@@ -1688,7 +1711,7 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
     2. 選擇題 (支援①②③④與(1)(2)(3)(4)格式)
     3. 頁面精準做一做題組與連連看
     4. 通用規則解析：填空題（括號填空、數學算式填空、比大小、應用題「答：…」填空）、打√勾選題
-       ※ 所有填充題一律保持純文字輸入框（options=None），不給下拉選單！
+       ※ 所有填充題一律保持純文字輸入框（無下拉選單）！
     """
     if not subject:
         subject = detect_subject_from_name(source_name)
@@ -1712,7 +1735,7 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
         tf_pattern = re.compile(r'[\(（]\s*([○◯O×X✕✓√]?)\s*[\)）]\s*(\d+)\s*[\.、]\s*([^()（）①②③④]+?[。？\?])')
         for match in tf_pattern.finditer(joined_text):
             raw_ans, q_num, q_body = match.groups()
-            q_body = re.sub(r'\s+', '', q_body)
+            q_body = clean_math_symbols(re.sub(r'\s+', '', q_body))
             if len(q_body) < 6 or any(k in q_body for k in ["選擇題", "是非題", "做一做", "勾選題", "配合題", "排序題"]):
                 continue
             ans = "○" if raw_ans in ["○", "◯", "O", "✓", "√"] else ("×" if raw_ans in ["×", "X", "✕"] else "○")
@@ -1735,11 +1758,11 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
         )
         for match in mc4_pattern.finditer(joined_text):
             raw_ans, q_num, q_stem, opt1, opt2, opt3, opt4 = match.groups()
-            q_stem = re.sub(r'\s+', '', q_stem)
-            o1 = re.sub(r'\s+', '', opt1).rstrip('。')
-            o2 = re.sub(r'\s+', '', opt2).rstrip('。')
-            o3 = re.sub(r'\s+', '', opt3).rstrip('。')
-            o4 = re.sub(r'\s+', '', opt4).rstrip('。')
+            q_stem = clean_math_symbols(re.sub(r'\s+', '', q_stem))
+            o1 = clean_math_symbols(re.sub(r'\s+', '', opt1).rstrip('。'))
+            o2 = clean_math_symbols(re.sub(r'\s+', '', opt2).rstrip('。'))
+            o3 = clean_math_symbols(re.sub(r'\s+', '', opt3).rstrip('。'))
+            o4 = clean_math_symbols(re.sub(r'\s+', '', opt4).rstrip('。'))
             o4 = re.split(r'(?:三、|四、|3做一做|做一做|素養題|勾選題|配合題|排序題)', o4)[0].strip()
             opts = [f"①{o1}", f"②{o2}", f"③{o3}", f"④{o4}"]
             ans_map = {"①": opts[0], "1": opts[0], "②": opts[1], "2": opts[1], "③": opts[2], "3": opts[2], "④": opts[3], "4": opts[3]}
@@ -1756,7 +1779,7 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
                 "exp": f"來源：{source_name} 第 {page_idx+1} 頁"
             })
 
-        # 國語課堂練習常見 3 選項選擇題： 1.(②)題目 ①選項1 ②選項2 ③選項3
+        # 國語課堂練習常見 3 選項選擇題
         if subject == "📘 國語":
             mc3_pattern = re.compile(
                 r'(\d+)\s*[\.、]\s*[\(（]\s*([①②③123]?)\s*[\)）]\s*([^①②③]{4,100}?)\s*'
@@ -1764,10 +1787,10 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
             )
             for match in mc3_pattern.finditer(joined_text):
                 q_num, raw_ans, q_stem, opt1, opt2, opt3 = match.groups()
-                q_stem = re.sub(r'\s+', '', q_stem)
-                o1 = re.sub(r'\s+', '', opt1).rstrip('。')
-                o2 = re.sub(r'\s+', '', opt2).rstrip('。')
-                o3 = re.split(r'(?:三、|四、|\d+\.)', re.sub(r'\s+', '', opt3).rstrip('。'))[0].strip()
+                q_stem = clean_math_symbols(re.sub(r'\s+', '', q_stem))
+                o1 = clean_math_symbols(re.sub(r'\s+', '', opt1).rstrip('。'))
+                o2 = clean_math_symbols(re.sub(r'\s+', '', opt2).rstrip('。'))
+                o3 = re.split(r'(?:三、|四、|\d+\.)', clean_math_symbols(re.sub(r'\s+', '', opt3)).rstrip('。'))[0].strip()
                 opts = [f"①{o1}", f"②{o2}", f"③{o3}"]
                 ans_map = {"①": opts[0], "1": opts[0], "②": opts[1], "2": opts[1], "③": opts[2], "3": opts[2]}
                 ans_val = ans_map.get(raw_ans, opts[0])
@@ -1788,38 +1811,34 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
         if specific_qs:
             parsed_list.extend(specific_qs)
 
-        # 4. 通用深度「填空題／計算題／代號題」解析器（全部維持純填空 input，options=None）
+        # 4. 通用深度「填空題／計算題／代號題」解析器（全部維持純填空 input）
         general_blanks = []
 
-        # (A) 數學隨堂演練：算式與括號數字/符號填空 (如 3000-4000-(5000)、6546 ( > ) 6365、答：2940元)
         if subject == "🔢 數學":
-            # 擷取括號內填數或符號：如 (1) ... ( 7000 ) 或 6546 ( > ) 6365
             math_paren_pat = re.compile(r'([^\n()（）]{2,30}?[\(（]\s*([0-9><=＋－×÷Lmlcm大和小左右邊頂點圓心圓周半徑直徑長方形正方形會不會甲乙丙丁ㄅㄆㄇㄈ]{1,10})\s*[\)）][^\n()（）]{0,15})')
             for m in math_paren_pat.finditer(joined_text):
                 expr_full, ans_val = m.groups()
-                expr_clean = re.sub(r'\s+', '', expr_full)
+                expr_clean = clean_math_symbols(re.sub(r'\s+', '', expr_full))
                 if any(w in expr_clean for w in ["配合課本", "單位:", "題型", "誤差範圍", "僅供參考", "填大或小", "填長或短", "填半徑或直徑", "填會或不會"]):
                     continue
                 if re.match(r'^[\(（]\d+[\)）]$', expr_clean):
                     continue
                 masked_expr = re.sub(r'[\(（]\s*' + re.escape(ans_val) + r'\s*[\)）]', '【 ＿＿ 】', expr_clean, count=1)
-                general_blanks.append({"label": masked_expr, "ans": ans_val.strip()})
+                general_blanks.append({"label": masked_expr, "ans": clean_math_symbols(ans_val)})
 
-            # 擷取應用題「答：XXX」
             math_ans_pat = re.compile(r'(\(\d+\)[^答]{8,90}?)\s*答\s*[:：]\s*([0-9\u4e00-\u9fff\.…、，]+)')
             for m in math_ans_pat.finditer(joined_text):
                 stem_part, ans_part = m.groups()
-                stem_clean = re.sub(r'\s+', '', stem_part)
-                ans_clean = re.sub(r'\s+', '', ans_part).rstrip('。')
+                stem_clean = clean_math_symbols(re.sub(r'\s+', '', stem_part))
+                ans_clean = clean_math_symbols(re.sub(r'\s+', '', ans_part).rstrip('。'))
                 general_blanks.append({"label": f"應用題 {stem_clean[:42]}... ➔ 答：", "ans": ans_clean})
 
         else:
-            # (B) 自然／社會／國語：做一做代號配對與打勾畫圈填空 (如 (丙)(1)管理學校門禁 或 (√)①小白菜)
             if not specific_qs:
                 sub_code_pattern = re.compile(r'[\(（]\s*([√✓○◯×X✕△A-F甲乙丙丁ㄅㄆㄇㄈ1-6])\s*[\)）]\s*([①②③④⑤⑥\(\d\)\d\.、\s]*[\u4e00-\u9fff]{2,18})')
                 for sm in sub_code_pattern.finditer(joined_text):
                     ans_sym, item_lbl = sm.groups()
-                    item_lbl_clean = re.sub(r'\s+', '', item_lbl)
+                    item_lbl_clean = clean_math_symbols(re.sub(r'\s+', '', item_lbl))
                     if len(item_lbl_clean) > 18 or len(item_lbl_clean) < 2 or "每題" in item_lbl_clean or "共" in item_lbl_clean:
                         continue
                     ans_norm = "√" if ans_sym in ["√", "✓"] else ("○" if ans_sym in ["○", "◯"] else ("×" if ans_sym in ["×", "X", "✕"] else ans_sym))
@@ -1828,12 +1847,11 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
                         "ans": ans_norm
                     })
 
-            # (C) 自然／社會／國語：句子中的括號填空（如：屬於(藤本)莖、撥打(110)或(113)、不小心跌進(水)溝）
             if not specific_qs:
                 inline_fill_pattern = re.compile(r'([\u4e00-\u9fff0-9A-Za-z，、：]{2,25}?[\(（]\s*([\u4e00-\u9fffA-DSNsN0-9]{1,8})\s*[\)）][\u4e00-\u9fff]{0,12})')
                 for im in inline_fill_pattern.finditer(joined_text):
                     full_phr, ans_tok = im.groups()
-                    full_phr_clean = re.sub(r'\s+', '', full_phr)
+                    full_phr_clean = clean_math_symbols(re.sub(r'\s+', '', full_phr))
                     if any(skip_w in full_phr_clean for skip_w in ["每題", "每格", "共", "分)", "爺爺或外公", "奶奶或外婆", "日日春", "蓮花", "並列複句", "承接複句", "條件複句", "因果複句", "目的複句", "轉折複句", "遞進複句", "假設複句", "擬人化", "視覺", "聽覺", "觸覺", "嗅覺"]):
                         continue
                     if re.match(r'^[\(（]\d+[\)）]', full_phr_clean):
@@ -1841,11 +1859,10 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
                     masked_phr = re.sub(r'[\(（]\s*' + re.escape(ans_tok) + r'\s*[\)）]', '【 ＿＿ 】', full_phr_clean, count=1)
                     general_blanks.append({
                         "label": masked_phr,
-                        "ans": ans_tok.strip()
+                        "ans": clean_math_symbols(ans_tok)
                     })
 
         if general_blanks:
-            # 避免單一題組過長，每 10 空拆為一個填空題組
             for chunk_i in range(0, len(general_blanks), 10):
                 chunk = general_blanks[chunk_i:chunk_i + 10]
                 parsed_list.append({
@@ -1863,7 +1880,7 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
 
 
 def ensure_db_questions_upgraded():
-    """當 PARSER_VERSION 更新時，自動將 SQLite 內已儲存的 PDF 重新深度解析"""
+    """當 PARSER_VERSION 更新時，自動將 SQLite 內已儲存的 PDF 重新深度解析並清除多餘符號"""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -1919,9 +1936,10 @@ def render_interactive_question(idx: int, item: dict, form_prefix: str):
     )
 
     if q_type in ["是非題", "選擇題"]:
+        cleaned_opts = [clean_cite(o) for o in item["options"]]
         st.radio(
             f"作答_{form_prefix}_{idx}",
-            item["options"],
+            cleaned_opts,
             index=None,
             key=f"{form_prefix}_q_{idx}",
             label_visibility="collapsed",
@@ -1950,14 +1968,14 @@ def render_interactive_question(idx: int, item: dict, form_prefix: str):
 
     elif q_type == "連連看":
         st.caption("👇 請為左邊的每一個項目選擇右邊對應的連線目標（選完後下方會即時畫出彩色連線！）：")
-        left_items = item.get("left_items", [])
-        right_items = item.get("right_items", [])
+        left_items = [clean_cite(x) for x in item.get("left_items", [])]
+        right_items = [clean_cite(x) for x in item.get("right_items", [])]
         current_pairs = {}
         cols = st.columns(2)
         for l_i, l_text in enumerate(left_items):
             with cols[l_i % 2]:
                 sel = st.selectbox(
-                    f"🔗 {clean_cite(l_text)} 連到 👉",
+                    f"🔗 {l_text} 連到 👉",
                     ["-- 請選擇連線對象 --"] + right_items,
                     key=f"{form_prefix}_q_{idx}_match_{l_i}"
                 )
@@ -1968,13 +1986,12 @@ def render_interactive_question(idx: int, item: dict, form_prefix: str):
 
 def is_blank_answer_correct(user_val: str, ans_val: str) -> bool:
     """智慧型填空比對：支援全形半形符號、勾選圈選同義字與關鍵詞比對"""
-    u = user_val.strip().replace(" ", "").replace(" ", "").upper()
-    a = ans_val.strip().replace(" ", "").replace(" ", "").upper()
+    u = clean_math_symbols(user_val).replace(" ", "").replace(" ", "").upper()
+    a = clean_math_symbols(ans_val).replace(" ", "").replace(" ", "").upper()
     if not u:
         return False
     if u == a:
         return True
-    # 符號同義詞群組
     sym_groups = [
         {"√", "✓", "V", "打√", "打V"},
         {"○", "◯", "O", "0", "畫○", "畫O"},
@@ -1984,15 +2001,12 @@ def is_blank_answer_correct(user_val: str, ans_val: str) -> bool:
     for grp in sym_groups:
         if u in grp and a in grp:
             return True
-    # 去除標點與單位後比對
     u_core = re.sub(r'[.、，。：:（）()「」]', '', u)
     a_core = re.sub(r'[.、，。：:（）()「」]', '', a)
     if u_core and u_core == a_core:
         return True
-    # 若標準答案為多字詞（如「力的作用點」），學生填「作用點」或完整「力的作用點」皆算對
     if len(u_core) >= 2 and (u_core in a_core or a_core in u_core):
         return True
-    # 代號題：若學生填「乙.吸引動物採食傳播」而答案為「乙」
     if len(a_core) == 1 and u_core.startswith(a_core):
         return True
     return False
@@ -2004,15 +2018,16 @@ def grade_interactive_question(idx: int, item: dict, form_prefix: str) -> tuple:
 
     if q_type in ["是非題", "選擇題"]:
         u_ans = st.session_state.get(f"{form_prefix}_q_{idx}")
-        is_ok = (u_ans == item["ans"])
-        return is_ok, (u_ans if u_ans else "未作答"), item["ans"]
+        expected_ans = clean_cite(item["ans"])
+        is_ok = (u_ans == expected_ans)
+        return is_ok, (u_ans if u_ans else "未作答"), expected_ans
 
     elif q_type == "勾選題":
         chosen = []
         for opt_i, opt_label in enumerate(item["options"]):
             if st.session_state.get(f"{form_prefix}_q_{idx}_chk_{opt_i}", False):
-                chosen.append(opt_label)
-        expected = item["ans"]
+                chosen.append(clean_cite(opt_label))
+        expected = [clean_cite(x) for x in item["ans"]]
         is_ok = (set(chosen) == set(expected))
         u_str = "、".join(chosen) if chosen else "未勾選"
         c_str = "、".join(expected)
@@ -2026,7 +2041,7 @@ def grade_interactive_question(idx: int, item: dict, form_prefix: str) -> tuple:
         for b_i, b_item in enumerate(blanks):
             raw_val = st.session_state.get(f"{form_prefix}_q_{idx}_blank_{b_i}", "")
             u_val = str(raw_val).strip()
-            ans_val = str(b_item["ans"]).strip()
+            ans_val = clean_cite(b_item["ans"]).strip()
             sub_ok = is_blank_answer_correct(u_val, ans_val)
             if not sub_ok:
                 all_ok = False
@@ -2035,16 +2050,17 @@ def grade_interactive_question(idx: int, item: dict, form_prefix: str) -> tuple:
         return all_ok, " ｜ ".join(u_parts), " ｜ ".join(c_parts)
 
     elif q_type == "連連看":
-        left_items = item.get("left_items", [])
-        right_items = item.get("right_items", [])
-        expected_map = item.get("ans", {})
+        left_items = [clean_cite(x) for x in item.get("left_items", [])]
+        right_items = [clean_cite(x) for x in item.get("right_items", [])]
+        raw_expected_map = item.get("ans", {})
+        expected_map = {clean_cite(k): clean_cite(v) for k, v in raw_expected_map.items()}
         user_map = {}
         all_ok = True
         u_parts = []
         c_parts = []
         for l_i, l_text in enumerate(left_items):
             sel = st.session_state.get(f"{form_prefix}_q_{idx}_match_{l_i}", "-- 請選擇連線對象 --")
-            u_val = "" if sel == "-- 請選擇連線對象 --" else sel
+            u_val = "" if sel == "-- 請選擇連線對象 --" else clean_cite(sel)
             if u_val:
                 user_map[l_text] = u_val
             exp_val = expected_map.get(l_text, "")
