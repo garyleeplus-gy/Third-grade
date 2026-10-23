@@ -3,92 +3,455 @@ import fitz  # PyMuPDF
 from PIL import Image
 import numpy as np
 import pandas as pd
-import io
+import sqlite3
 import re
 import json
 import random
+import hashlib
+from datetime import datetime
 
 # ==========================================
-# 頁面與行動裝置自適應設定 (RWD)
+# 0. 頁面與行動裝置自適應設定 (RWD)
 # ==========================================
 st.set_page_config(
-    page_title="小三自然科學｜重點複習＆題庫闖關系統",
+    page_title="小三自然科學｜重點複習＆全題型互動題庫",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.markdown("""
-<style>
-    /* 手機與電腦自適應字體與卡片美化 */
-    .main .block-container {
-        padding-top: 1.2rem;
-        padding-bottom: 2.5rem;
-        max-width: 1100px;
-    }
-    .review-card {
-        background-color: #f8fafc;
-        border-left: 6px solid #10b981;
-        padding: 14px 18px;
-        border-radius: 10px;
-        margin-bottom: 12px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-        font-size: 1.05rem;
-        line-height: 1.65;
-        color: #1e293b;
-    }
-    .exp-card {
-        background-color: #fffbeb;
-        border-left: 6px solid #f59e0b;
-        padding: 14px 18px;
-        border-radius: 10px;
-        margin-bottom: 12px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-        font-size: 1.02rem;
-        line-height: 1.6;
-        color: #1e293b;
-    }
-    .mask-word {
-        background-color: #fef08a;
-        color: #b45309;
-        padding: 2px 6px;
-        border-radius: 5px;
-        font-weight: 700;
-        border-bottom: 2px dashed #f59e0b;
-    }
-    .hidden-word {
-        background-color: #cbd5e1;
-        color: transparent;
-        padding: 2px 8px;
-        border-radius: 5px;
-        user-select: none;
-        border-bottom: 2px solid #64748b;
-    }
-    div.stButton > button {
-        border-radius: 10px;
-        font-weight: 600;
-        padding: 0.55rem 1rem;
-    }
-</style>
-""", unsafe_allow_html=True)
+DB_PATH = "science_persistent_store.db"
+
+
+# ==========================================
+# 1. SQLite 永久儲存資料庫引擎（重啟網頁不消失）
+# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # 儲存上傳的 PDF 二進位檔案
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS uploaded_pdfs (
+            filename TEXT PRIMARY KEY,
+            pdf_bytes BLOB,
+            upload_time TEXT
+        )
+    """)
+    # 儲存匯入或自訂的題目
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS custom_questions (
+            q_id TEXT PRIMARY KEY,
+            pdf_name TEXT,
+            page_num INTEGER,
+            q_json TEXT
+        )
+    """)
+    # 儲存錯題本
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS wrong_questions (
+            q_id TEXT PRIMARY KEY,
+            q_json TEXT,
+            user_last_ans TEXT,
+            wrong_count INTEGER DEFAULT 1,
+            updated_at TEXT
+        )
+    """)
+    # 儲存測驗歷史紀錄
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS exam_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exam_title TEXT,
+            score INTEGER,
+            correct_count INTEGER,
+            total_count INTEGER,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def get_question_id(q_dict: dict) -> str:
+    raw = f"{q_dict.get('unit','')}_{q_dict.get('type','')}_{q_dict.get('q','')}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def db_save_pdf(filename: str, pdf_bytes: bytes):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO uploaded_pdfs (filename, pdf_bytes, upload_time) VALUES (?, ?, ?)",
+        (filename, sqlite3.Binary(pdf_bytes), datetime.now().strftime("%Y-%m-%d %H:%M"))
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_delete_pdf(filename: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM uploaded_pdfs WHERE filename = ?", (filename,))
+    c.execute("DELETE FROM custom_questions WHERE pdf_name = ?", (filename,))
+    conn.commit()
+    conn.close()
+
+
+def db_load_all_pdfs() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT filename, pdf_bytes FROM uploaded_pdfs ORDER BY upload_time DESC")
+    rows = c.fetchall()
+    conn.close()
+    return {r[0]: bytes(r[1]) for r in rows}
+
+
+def db_save_custom_questions(questions: list, pdf_name: str = "手動/PDF匯入", page_num: int = 0):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    for q in questions:
+        qid = get_question_id(q)
+        p_num = q.get("page_num", page_num)
+        p_name = q.get("pdf_name", pdf_name)
+        c.execute(
+            "INSERT OR REPLACE INTO custom_questions (q_id, pdf_name, page_num, q_json) VALUES (?, ?, ?, ?)",
+            (qid, p_name, p_num, json.dumps(q, ensure_ascii=False))
+        )
+    conn.commit()
+    conn.close()
+
+
+def db_load_custom_questions() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT q_json FROM custom_questions")
+    rows = c.fetchall()
+    conn.close()
+    return [json.loads(r[0]) for r in rows]
+
+
+def db_add_wrong_question(q_dict: dict, user_ans_str: str):
+    qid = get_question_id(q_dict)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT wrong_count FROM wrong_questions WHERE q_id = ?", (qid,))
+    row = c.fetchone()
+    w_count = (row[0] + 1) if row else 1
+    c.execute(
+        "INSERT OR REPLACE INTO wrong_questions (q_id, q_json, user_last_ans, wrong_count, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (qid, json.dumps(q_dict, ensure_ascii=False), str(user_ans_str), w_count, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_remove_wrong_question(qid: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM wrong_questions WHERE q_id = ?", (qid,))
+    conn.commit()
+    conn.close()
+
+
+def db_clear_all_wrong_questions():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM wrong_questions")
+    conn.commit()
+    conn.close()
+
+
+def db_load_wrong_questions() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT q_id, q_json, user_last_ans, wrong_count, updated_at FROM wrong_questions ORDER BY updated_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    result = []
+    for r in rows:
+        item = json.loads(r[1])
+        item["_qid"] = r[0]
+        item["_last_ans"] = r[2]
+        item["_wrong_count"] = r[3]
+        item["_updated_at"] = r[4]
+        result.append(item)
+    return result
+
+
+def db_save_exam_history(title: str, score: int, correct_cnt: int, total_cnt: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO exam_history (exam_title, score, correct_count, total_count, created_at) VALUES (?, ?, ?, ?, ?)",
+        (title, score, correct_cnt, total_cnt, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    )
+    conn.commit()
+    conn.close()
+
+
+def db_load_exam_history() -> list:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT exam_title, score, correct_count, total_count, created_at FROM exam_history ORDER BY id DESC LIMIT 30")
+    rows = c.fetchall()
+    conn.close()
+    return [{"測驗名稱": r[0], "分數": f"{r[1]} 分", "答對題數": f"{r[2]} / {r[3]}", "測驗時間": r[4]} for r in rows]
+
+
+init_db()
+
+
+# ==========================================
+# 2. 動態大字體與 RWD 自適應樣式注入
+# ==========================================
+def apply_responsive_css(scale_pct: int):
+    base_rem = round(scale_pct / 100.0, 2)
+    title_rem = round(base_rem * 1.35, 2)
+    card_rem = round(base_rem * 1.12, 2)
+
+    st.markdown(f"""
+    <style>
+        /* 全域容器自適應 */
+        .main .block-container {{
+            padding-top: 1rem;
+            padding-bottom: 3rem;
+            padding-left: clamp(0.8rem, 3vw, 2.5rem);
+            padding-right: clamp(0.8rem, 3vw, 2.5rem);
+            max-width: 1280px;
+        }}
+        /* 全面放大一般文字、題目、選項、輸入框與表格字體 */
+        html, body, [data-testid="stAppViewContainer"] {{
+            font-size: {scale_pct}% !important;
+        }}
+        div[data-testid="stMarkdownContainer"] p,
+        div[data-testid="stMarkdownContainer"] li {{
+            font-size: {card_rem}rem !important;
+            line-height: 1.75 !important;
+        }}
+        /* 放大單選 Radio 與多選 Checkbox 觸控區域與字體 */
+        label[data-baseweb="radio"], label[data-baseweb="checkbox"] {{
+            padding: 8px 12px !important;
+            margin-bottom: 6px !important;
+            background-color: #f8fafc;
+            border: 1px solid #cbd5e1;
+            border-radius: 10px;
+            min-height: 48px;
+            display: flex !important;
+            align-items: center !important;
+            transition: all 0.15s ease;
+        }}
+        label[data-baseweb="radio"]:hover, label[data-baseweb="checkbox"]:hover {{
+            background-color: #e0f2fe;
+            border-color: #38bdf8;
+        }}
+        label[data-baseweb="radio"] div, label[data-baseweb="checkbox"] div {{
+            font-size: {card_rem}rem !important;
+            font-weight: 600 !important;
+            color: #0f172a !important;
+        }}
+        /* 放大下拉選單與文字輸入框 */
+        div[data-baseweb="select"] > div,
+        div[data-baseweb="input"] input {{
+            font-size: {card_rem}rem !important;
+            min-height: 48px !important;
+            font-weight: 600 !important;
+        }}
+        /* 重點複習卡片與實驗卡片 */
+        .review-card {{
+            background-color: #f8fafc;
+            border-left: 7px solid #10b981;
+            padding: 16px 20px;
+            border-radius: 12px;
+            margin-bottom: 14px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.06);
+            font-size: {card_rem}rem !important;
+            line-height: 1.8 !important;
+            color: #1e293b;
+        }}
+        .exp-card {{
+            background-color: #fffbeb;
+            border-left: 7px solid #f59e0b;
+            padding: 16px 20px;
+            border-radius: 12px;
+            margin-bottom: 14px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.06);
+            font-size: {card_rem}rem !important;
+            line-height: 1.8 !important;
+            color: #1e293b;
+        }}
+        .q-box {{
+            background-color: #ffffff;
+            border: 2px solid #e2e8f0;
+            border-left: 8px solid #3b82f6;
+            padding: 18px 20px;
+            border-radius: 14px;
+            margin-bottom: 14px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+            font-size: {title_rem}rem !important;
+            font-weight: 700;
+            color: #0f172a;
+        }}
+        .mask-word {{
+            background-color: #fef08a;
+            color: #b45309;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-weight: 800;
+            border-bottom: 2px dashed #f59e0b;
+        }}
+        .hidden-word {{
+            background-color: #cbd5e1;
+            color: transparent;
+            padding: 3px 10px;
+            border-radius: 6px;
+            user-select: none;
+            border-bottom: 3px solid #475569;
+            cursor: pointer;
+        }}
+        /* 按鈕放大與觸控友善 */
+        div.stButton > button, div[data-testid="stFormSubmitButton"] > button {{
+            border-radius: 12px !important;
+            font-size: {card_rem}rem !important;
+            font-weight: 700 !important;
+            min-height: 52px !important;
+            padding: 0.6rem 1.2rem !important;
+        }}
+        /* 表格字體放大 */
+        .custom-table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 12px 0 20px 0;
+            font-size: {card_rem}rem !important;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+        }}
+        .custom-table th {{
+            background-color: #0284c7;
+            color: #ffffff;
+            text-align: left;
+            padding: 12px 15px;
+            font-weight: 700;
+        }}
+        .custom-table td {{
+            padding: 12px 15px;
+            border-bottom: 1px solid #e2e8f0;
+            color: #1e293b;
+            line-height: 1.6;
+        }}
+        .custom-table tr:nth-child(even) {{
+            background-color: #f8fafc;
+        }}
+        /* 手機窄螢幕自適應微調 */
+        @media (max-width: 768px) {{
+            .main .block-container {{
+                padding-left: 0.6rem !important;
+                padding-right: 0.6rem !important;
+            }}
+            .q-box {{
+                padding: 14px !important;
+                font-size: {card_rem}rem !important;
+            }}
+            .custom-table th, .custom-table td {{
+                padding: 8px 10px !important;
+            }}
+        }}
+    </style>
+    """, unsafe_allow_html=True)
 
 
 def clean_cite(text: str) -> str:
-    """移除字串中的來源標記以維持介面整潔"""
     return re.sub(r'\s*\[cite:\s*[\d,\s]+\]', '', str(text))
 
 
 def render_masked_text(text: str, hide_keywords: bool) -> str:
-    """將 【關鍵字】 轉換為重點標示或遮罩填空"""
     text = clean_cite(text)
     if hide_keywords:
-        return re.sub(r'【(.*?)】', r'<span class="hidden-word" title="點擊上方開關顯示答案">＿＿＿</span>', text)
+        return re.sub(r'【(.*?)】', r'<span class="hidden-word">＿＿＿＿</span>', text)
     else:
         return re.sub(r'【(.*?)】', r'<span class="mask-word">\1</span>', text)
 
 
+def render_html_table(columns: list, rows: list, hide_kw: bool = False):
+    html = '<div style="overflow-x:auto;"><table class="custom-table"><thead><tr>'
+    for col in columns:
+        html += f"<th>{clean_cite(col)}</th>"
+    html += "</tr></thead><tbody>"
+    for r in rows:
+        html += "<tr>"
+        for idx, cell in enumerate(r):
+            c_str = clean_cite(cell)
+            if hide_kw and idx > 0:
+                c_str = '<span class="hidden-word">＿＿＿＿＿＿＿＿</span>'
+            html += f"<td>{c_str}</td>"
+        html += "</tr>"
+    html += "</tbody></table></div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
 # ==========================================
-# 1. 第一份《重點複習》100% 完整資料庫
+# 3. 連連看 SVG 動態畫線視覺化元件
+# ==========================================
+def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, correct_pairs: dict = None, show_grading: bool = False):
+    """
+    動態繪製連連看左右配對與彩色連線 SVG，自適應手機與電腦寬度
+    """
+    n_rows = max(len(left_items), len(right_items))
+    row_h = 68
+    svg_h = n_rows * row_h + 24
+    colors = ["#2563eb", "#d97706", "#7c3aed", "#059669", "#db2777", "#0891b2"]
+
+    svg_lines = []
+    # 左側項目區塊
+    for i, l_text in enumerate(left_items):
+        cy = 38 + i * row_h
+        l_clean = clean_cite(l_text)
+        svg_lines.append(
+            f'<rect x="10" y="{cy-24}" width="260" height="48" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>'
+            f'<text x="24" y="{cy+6}" font-size="16" font-weight="bold" fill="#1e3a8a">{l_clean[:16]}</text>'
+            f'<circle cx="270" cy="{cy}" r="6" fill="#2563eb"/>'
+        )
+
+    # 右側項目區塊
+    for j, r_text in enumerate(right_items):
+        cy = 38 + j * row_h
+        r_clean = clean_cite(r_text)
+        svg_lines.append(
+            f'<rect x="450" y="{cy-24}" width="320" height="48" rx="10" fill="#f0fdf4" stroke="#10b981" stroke-width="2"/>'
+            f'<text x="466" y="{cy+6}" font-size="16" font-weight="bold" fill="#065f46">{r_clean[:20]}</text>'
+            f'<circle cx="450" cy="{cy}" r="6" fill="#10b981"/>'
+        )
+
+    # 繪製使用者連線
+    for i, l_text in enumerate(left_items):
+        chosen_r = user_pairs.get(l_text)
+        if chosen_r and chosen_r in right_items:
+            j = right_items.index(chosen_r)
+            y1 = 38 + i * row_h
+            y2 = 38 + j * row_h
+            if show_grading and correct_pairs:
+                is_ok = (correct_pairs.get(l_text) == chosen_r)
+                stroke_col = "#16a34a" if is_ok else "#dc2626"
+                dash = "" if is_ok else 'stroke-dasharray="8,6"'
+            else:
+                stroke_col = colors[i % len(colors)]
+                dash = ""
+            svg_lines.append(
+                f'<line x1="270" y1="{y1}" x2="450" y2="{y2}" stroke="{stroke_col}" stroke-width="4" {dash} stroke-linecap="round"/>'
+            )
+
+    svg_html = f"""
+    <div style="width:100%; overflow-x:auto; background:#ffffff; border:1px solid #e2e8f0; border-radius:12px; padding:10px; margin:8px 0;">
+        <svg viewBox="0 0 780 {svg_h}" width="100%" height="{svg_h}" style="min-width:560px;">
+            {''.join(svg_lines)}
+        </svg>
+    </div>
+    """
+    st.markdown(svg_html, unsafe_allow_html=True)
+
+
+# ==========================================
+# 4. 第一份《重點複習》100% 完整資料庫
 # ==========================================
 COMPLETE_REVIEW_DATA = {
     "單元1：多采多姿的植物": {
@@ -546,101 +909,251 @@ COMPLETE_REVIEW_DATA = {
 
 
 # ==========================================
-# 2. 內建完整精選題庫（涵蓋重點複習、期中期末、校用卷與月考卷）
+# 5. 全題型互動題庫（是非、選擇、連連看、填充/代號、勾選題）
 # ==========================================
 DEFAULT_QUIZ_BANK = [
-    # --- 第一單元：多采多姿的植物 ---
+    # --- 連連看配對題 (Matching) ---
+    {
+        "unit": "單元1：多采多姿的植物",
+        "type": "連連看",
+        "q": "【做一做・連連看】下列植物的葉子在莖或枝條上的生長情形（葉序）分別是哪一種？請配對連線：",
+        "left_items": ["(1) 朱槿", "(2) 軟枝黃蟬", "(3) 福木", "(4) 黑板樹", "(5) 南美蟛蜞菊", "(6) 樟樹"],
+        "right_items": ["互生（一節1片）", "對生（一節2片）", "輪生（一節3片以上）"],
+        "ans": {
+            "(1) 朱槿": "互生（一節1片）",
+            "(2) 軟枝黃蟬": "輪生（一節3片以上）",
+            "(3) 福木": "對生（一節2片）",
+            "(4) 黑板樹": "輪生（一節3片以上）",
+            "(5) 南美蟛蜞菊": "對生（一節2片）",
+            "(6) 樟樹": "互生（一節1片）"
+        },
+        "exp": "朱槿、樟樹、榕樹為互生；福木、南美蟛蜞菊、桂花、青楓為對生；軟枝黃蟬、黑板樹為輪生[cite: 2, 76, 87]。"
+    },
+    {
+        "unit": "單元1：多采多姿的植物",
+        "type": "連連看",
+        "q": "【做一做・連連看】下列各種植物的葉形特徵是什麼？請配對連線：",
+        "left_items": ["(1) 福木", "(2) 萬年青", "(3) 甘藷", "(4) 百合", "(5) 榕樹", "(6) 棕葉狗尾草"],
+        "right_items": ["像愛心的形狀", "橢圓形", "細細長長的"],
+        "ans": {
+            "(1) 福木": "橢圓形",
+            "(2) 萬年青": "細細長長的",
+            "(3) 甘藷": "像愛心的形狀",
+            "(4) 百合": "細細長長的",
+            "(5) 榕樹": "橢圓形",
+            "(6) 棕葉狗尾草": "細細長長的"
+        },
+        "exp": "甘藷葉像愛心；福木、榕樹葉呈橢圓形；萬年青、百合、棕葉狗尾草葉子細細長長的（且為平行脈）[cite: 89]。"
+    },
+    {
+        "unit": "單元2：生活中的力",
+        "type": "連連看",
+        "q": "【做一做・連連看】生活中有許多不同種類的力，下列情境分別是利用什麼力？請配對連線：",
+        "left_items": ["(1) 輪船在海上航行", "(2) 風箏在空中飛", "(3) 原子筆筆心縮回", "(4) 跳棋吸在鐵製棋盤上"],
+        "right_items": ["甲. 磁力", "乙. 水的浮力", "丙. 風力", "丁. 彈力"],
+        "ans": {
+            "(1) 輪船在海上航行": "乙. 水的浮力",
+            "(2) 風箏在空中飛": "丙. 風力",
+            "(3) 原子筆筆心縮回": "丁. 彈力",
+            "(4) 跳棋吸在鐵製棋盤上": "甲. 磁力"
+        },
+        "exp": "輪船利用水的浮力；風箏利用風力；原子筆彈簧利用彈力；磁吸式跳棋利用磁力[cite: 20, 21, 77]。"
+    },
+    {
+        "unit": "單元3：奇妙的空氣",
+        "type": "連連看",
+        "q": "【重點複習・連連看】下列物品或活動分別應用了空氣的什麼特性？請配對連線：",
+        "left_items": ["① 餅乾包裝鼓鼓的", "② 放風箏", "③ 空氣槍玩具", "④ 玩風帆"],
+        "right_items": ["A. 空氣占有空間", "B. 空氣可以被壓縮", "C. 空氣流動形成風"],
+        "ans": {
+            "① 餅乾包裝鼓鼓的": "A. 空氣占有空間",
+            "② 放風箏": "C. 空氣流動形成風",
+            "③ 空氣槍玩具": "B. 空氣可以被壓縮",
+            "④ 玩風帆": "C. 空氣流動形成風"
+        },
+        "exp": "餅乾包裝充氣防碎應用空氣占有空間；空氣槍玩具應用空氣可被壓縮；放風箏與玩風帆應用空氣流動形成風[cite: 44]。"
+    },
+    {
+        "unit": "單元4：廚房裡的科學",
+        "type": "連連看",
+        "q": "【做一做・連連看】將小蘇打粉、食鹽、醋、檸檬酸製成水溶液，分別加入紫色高麗菜汁後會呈現什麼顏色？",
+        "left_items": ["(1) 小蘇打粉", "(2) 食鹽", "(3) 醋", "(4) 檸檬酸"],
+        "right_items": ["甲. 紫色（中性）", "乙. 偏紅色（酸性）", "丙. 偏藍綠色（鹼性）"],
+        "ans": {
+            "(1) 小蘇打粉": "丙. 偏藍綠色（鹼性）",
+            "(2) 食鹽": "甲. 紫色（中性）",
+            "(3) 醋": "乙. 偏紅色（酸性）",
+            "(4) 檸檬酸": "乙. 偏紅色（酸性）"
+        },
+        "exp": "紫色高麗菜汁遇酸性（醋、檸檬酸）變偏紅色，遇中性（食鹽、砂糖）維持紫色，遇鹼性（小蘇打粉）變偏藍綠色[cite: 54, 85]。"
+    },
+    {
+        "unit": "單元4：廚房裡的科學",
+        "type": "連連看",
+        "q": "【做一做・連連看】下列廚房調味品的外觀、觸感與氣味描述，請配對連出正確答案：",
+        "left_items": ["(1) 黃砂糖", "(2) 黑胡椒粒", "(3) 食鹽"],
+        "right_items": [
+            "甲. 白色的，摸起來粗粗的，聞起來沒有氣味",
+            "乙. 黃色的，摸起來粗粗的，聞起來甜甜的",
+            "丙. 深棕色，摸起來粗粗的，聞起來有辛辣氣味"
+        ],
+        "ans": {
+            "(1) 黃砂糖": "乙. 黃色的，摸起來粗粗的，聞起來甜甜的",
+            "(2) 黑胡椒粒": "丙. 深棕色，摸起來粗粗的，聞起來有辛辣氣味",
+            "(3) 食鹽": "甲. 白色的，摸起來粗粗的，聞起來沒有氣味"
+        },
+        "exp": "黃砂糖呈黃色粗顆粒且有甜味；黑胡椒粒呈深棕色粗顆粒且有辛辣味；食鹽呈白色粗顆粒且無氣味[cite: 47, 95]。"
+    },
+
+    # --- 填充與代號題 (Fill-in / Code Matching) ---
+    {
+        "unit": "單元1：多采多姿的植物",
+        "type": "填充與代號題",
+        "q": "【做一做・分類與代號】請回答下列植物根的形態與小花蔓澤蘭素養題：",
+        "blanks": [
+            {"label": "(1) 小白菜的根屬於哪一種形態？", "options": ["軸根（打√）", "鬚根（畫○）"], "ans": "軸根（打√）"},
+            {"label": "(2) 蒜的根屬於哪一種形態？", "options": ["軸根（打√）", "鬚根（畫○）"], "ans": "鬚根（畫○）"},
+            {"label": "(3) 蔥的根屬於哪一種形態？", "options": ["軸根（打√）", "鬚根（畫○）"], "ans": "鬚根（畫○）"},
+            {"label": "(4) 莧菜的根屬於哪一種形態？", "options": ["軸根（打√）", "鬚根（畫○）"], "ans": "軸根（打√）"},
+            {"label": "(5) 小花蔓澤蘭的莖能沿著樹幹向上攀爬生長，屬於什麼莖？（可直接輸入或選擇）", "options": None, "ans": "藤本"}
+        ],
+        "exp": "小白菜、菠菜、莧菜為軸根；蔥、蒜、稻子為鬚根。小花蔓澤蘭會攀爬樹木，屬於藤本莖[cite: 5, 13, 14]。"
+    },
+    {
+        "unit": "單元1：多采多姿的植物",
+        "type": "填充與代號題",
+        "q": "【做一做・花朵構造與植物用途配對】請選出對應的花構造代號與植物生活產品：",
+        "blanks": [
+            {"label": "(1) 位在花朵最外圍，通常是綠色，具有保護和支撐花瓣的功能：", "options": ["甲. 花瓣", "乙. 花粉", "丙. 花萼", "丁. 雌蕊"], "ans": "丙. 花萼"},
+            {"label": "(2) 有些有鮮豔的顏色，能吸引動物前來：", "options": ["甲. 花瓣", "乙. 花粉", "丙. 花萼", "丁. 雌蕊"], "ans": "甲. 花瓣"},
+            {"label": "(3) 通常位於花朵中央，被雄蕊圍在中心：", "options": ["甲. 花瓣", "乙. 花粉", "丙. 花萼", "丁. 雌蕊"], "ans": "丁. 雌蕊"},
+            {"label": "(4) 位於雄蕊的頂端，傳到雌蕊上能繁殖後代：", "options": ["甲. 花瓣", "乙. 花粉", "丙. 花萼", "丁. 雌蕊"], "ans": "乙. 花粉"},
+            {"label": "(5) 家具（木桌、木椅）主要是由哪種植物的莖製成？", "options": ["A. 稻子", "B. 棉花", "C. 柳橙", "D. 樟樹"], "ans": "D. 樟樹"},
+            {"label": "(6) 衣服主要是由哪種植物製成？", "options": ["A. 稻子", "B. 棉花", "C. 柳橙", "D. 樟樹"], "ans": "B. 棉花"}
+        ],
+        "exp": "花萼在最外圍保護花瓣；雄蕊頂端有花粉；雌蕊在中央。樟樹可做家具，棉花可做衣服[cite: 7, 9, 81, 99]。"
+    },
+    {
+        "unit": "單元2：生活中的力",
+        "type": "填充與代號題",
+        "q": "【做一做・火車磁鐵與力的三要素填空】B車廂左端(②號)為 N 極，右端(③號)為 S 極，請回答下列問題：",
+        "blanks": [
+            {"label": "(1) 火車頭和車廂彼此要能成功連接，是利用磁鐵的哪一種特性？", "options": ["① 同極相斥", "② 異極相吸"], "ans": "② 異極相吸"},
+            {"label": "(2) 想要讓 A 火車頭(①號)與 B 車廂左端(②號 N 極)連接，①號磁鐵右側應為什麼極？（輸入 S 或 N）", "options": ["S", "N"], "ans": "S"},
+            {"label": "(3) 想要讓 B 車廂右端(③號 S 極)與 C 車廂左端(④號)連接，④號磁鐵左側應為什麼極？（輸入 S 或 N）", "options": ["S", "N"], "ans": "N"},
+            {"label": "(4) 踢足球時，腳碰觸到球的位置，稱為什麼？（輸入：力的作用點 / 力的方向 / 力的大小）", "options": ["力的作用點", "力的方向", "力的大小"], "ans": "力的作用點"},
+            {"label": "(5) 在力的圖示中，我們可以用「線段的長短」來表示什麼？", "options": ["力的作用點", "力的方向", "力的大小"], "ans": "力的大小"}
+        ],
+        "exp": "異極相吸：②號是 N 極，故①號右側為 S 極；③號是 S 極，故④號左側為 N 極。線段長短代表力的大小，箭頭代表力的方向，接觸位置代表力的作用點[cite: 16, 27, 28, 67, 87]。"
+    },
+    {
+        "unit": "單元4：廚房裡的科學",
+        "type": "填充與代號題",
+        "q": "【做一做・食鹽溶解實驗與未知粉末辨識】請根據實驗結果填入正確答案：",
+        "blanks": [
+            {"label": "(1) 在 50 毫升常溫水中，加入第 4 平匙食鹽攪拌後開始有溶不掉的顆粒出現，代表最多可完全溶解幾平匙食鹽？（輸入數字）", "options": None, "ans": "3"},
+            {"label": "(2) 當在水中加入第幾平匙攪拌後，杯底開始有溶不掉的食鹽顆粒出現？（輸入數字）", "options": None, "ans": "4"},
+            {"label": "(3) 白色、摸起來粗粗的、搓聞無氣味的廚房材料代號是？（甲.檸檬酸 / 乙.小蘇打粉 / 丙.黑胡椒粒）", "options": ["甲. 檸檬酸", "乙. 小蘇打粉", "丙. 黑胡椒粒"], "ans": "甲. 檸檬酸"},
+            {"label": "(4) 深棕色、摸起來粗粗的、搓聞有氣味的廚房材料代號是？", "options": ["甲. 檸檬酸", "乙. 小蘇打粉", "丙. 黑胡椒粒"], "ans": "丙. 黑胡椒粒"},
+            {"label": "(5) 白色、摸起來細細的、搓聞無氣味的廚房材料代號是？", "options": ["甲. 檸檬酸", "乙. 小蘇打粉", "丙. 黑胡椒粒"], "ans": "乙. 小蘇打粉"}
+        ],
+        "exp": "50毫升常溫水加到第 4 平匙出現沉澱，故最多完全溶解 3 平匙。檸檬酸為白色粗顆粒無氣味，黑胡椒粒為深棕色粗顆粒有氣味，小蘇打粉為白色細粉末無氣味[cite: 51, 58, 59]。"
+    },
+
+    # --- 勾選題 / 複選題 (Checkboxes 打√) ---
+    {
+        "unit": "單元2：生活中的力",
+        "type": "勾選題",
+        "q": "【做一做・打√勾選題】下列生活中的物品，哪些可以被磁鐵吸住？請將正確的全部打 √：",
+        "options": ["(1) 長尾夾", "(2) 橡皮擦", "(3) 迴紋針", "(4) 膠帶", "(5) 剪刀刀刃", "(6) 釘書針", "(7) 十元硬幣", "(8) 鋁罐"],
+        "ans": ["(1) 長尾夾", "(3) 迴紋針", "(5) 剪刀刀刃", "(6) 釘書針"],
+        "exp": "長尾夾、迴紋針、剪刀刀刃、釘書針、鐵釘、美工刀片為鐵製品，可被磁鐵吸住；橡皮擦、膠帶、十元硬幣、鋁罐不含鐵，無法被吸住[cite: 17, 83, 91, 93]。"
+    },
+    {
+        "unit": "單元2：生活中的力",
+        "type": "勾選題",
+        "q": "【期中評量・打√勾選題】下列哪些情境屬於「水傳送動力」的應用？請在 □ 中打 √：",
+        "options": ["① 馬桶水箱內的浮球", "② 用強力水柱清洗地面", "③ 水車轉動", "④ 郵輪在海上航行"],
+        "ans": ["② 用強力水柱清洗地面", "③ 水車轉動"],
+        "exp": "強力水柱沖洗地面與水車轉動（以及水槍射倒空罐）屬於水傳送動力；浮球與郵輪屬於水的浮力應用[cite: 23, 31]。"
+    },
+    {
+        "unit": "單元3：奇妙的空氣",
+        "type": "勾選題",
+        "q": "【期末評量・打√勾選題】兩個人利用打氣筒幫輪胎打氣：「輪胎打氣後就不再是扁扁的」、「氣打滿之後可以再多打一些氣進去，輪胎才有彈性」。從對話中可以發現空氣的哪些特性？",
+        "options": ["① 空氣占有空間", "② 空氣沒有固定形狀", "③ 空氣流動形成風", "④ 空氣可以被壓縮"],
+        "ans": ["① 空氣占有空間", "② 空氣沒有固定形狀", "④ 空氣可以被壓縮"],
+        "exp": "輪胎打氣後不再扁扁的證明空氣占有空間且沒有固定形狀；打滿後還能再多打氣進去證明空氣可以被壓縮[cite: 62]。"
+    },
+    {
+        "unit": "單元3：奇妙的空氣",
+        "type": "勾選題",
+        "q": "【做一做・打√勾選題】下列哪些是可以幫助維護空氣品質的作法？請打 √：",
+        "options": ["① 燃燒稻草與垃圾", "② 大量砍伐森林", "③ 騎腳踏車上學", "④ 利用風力發電（環保低汙染發電）", "⑤ 多搭乘大眾運輸工具"],
+        "ans": ["③ 騎腳踏車上學", "④ 利用風力發電（環保低汙染發電）", "⑤ 多搭乘大眾運輸工具"],
+        "exp": "騎腳踏車、使用風力發電、搭乘大眾運輸工具與多種樹皆有助於維護空氣品質[cite: 40, 45, 72]。"
+    },
+    {
+        "unit": "單元4：廚房裡的科學",
+        "type": "勾選題",
+        "q": "【做一做・打√勾選題】下列哪些物質可以完全溶解在水中成為水溶液？請打 √：",
+        "options": ["(1) 沙子", "(2) 檸檬酸", "(3) 砂糖", "(4) 食鹽", "(5) 黑胡椒粒", "(6) 小蘇打粉"],
+        "ans": ["(2) 檸檬酸", "(3) 砂糖", "(4) 食鹽", "(6) 小蘇打粉"],
+        "exp": "檸檬酸、砂糖、食鹽、小蘇打粉能完全溶解在水中；沙子與黑胡椒粒不能溶解在水中[cite: 48, 73]。"
+    },
+
+    # --- 是非題與選擇題 (True/False & Multiple Choice) ---
     {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "葉子是從莖上的節長出來，每種植物都會從一個節長出 2 片葉子。", "options": ["○", "×"], "ans": "×", "exp": "不同植物在節上生長葉子的方式不同，分為互生（1片）、對生（2片）和輪生（3片以上）[cite: 2, 12]。"},
     {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "大花咸豐草是草本莖，莖較細小但能直立，會向四面八方生長，幫助獲取陽光。", "options": ["○", "×"], "ans": "○", "exp": "大花咸豐草與長春花皆屬於草本莖，莖較細但能直立[cite: 4, 12]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "莧菜和蒜的根長得不一樣，莧菜有一條比較粗的主根（軸根）；蒜的根像鬍鬚一樣，細細小小的（鬚根）。", "options": ["○", "×"], "ans": "○", "exp": "小白菜、菠菜、莧菜為軸根；蔥、蒜、稻子為鬚根[cite: 5, 12, 89]。"},
+    {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "莧菜和蒜的根長得不一樣，莧菜有一條比較粗的主根；蒜的根像鬍鬚一樣，細細小小的。", "options": ["○", "×"], "ans": "○", "exp": "小白菜、菠菜、莧菜為軸根；蔥、蒜、稻子為鬚根[cite: 5, 12, 89]。"},
     {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "植物缺水時，葉子會下垂枯萎，只要將水澆在葉子上，植物就能恢復生氣。", "options": ["○", "×"], "ans": "×", "exp": "植物生長所需的水是由「根部」吸收，澆水時應澆在土壤上由根吸收[cite: 6, 12, 29]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "月橘的花能吸引蜜蜂等動物前來採食，讓牠們幫忙傳播花粉。", "options": ["○", "×"], "ans": "○", "exp": "花朵利用鮮豔花瓣、花蜜或特殊氣味吸引動物採食，幫助雄蕊花粉傳到雌蕊[cite: 7, 12]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "木瓜的果實芳香甜美，可以吸引小動物採食，幫助木瓜傳播種子。", "options": ["○", "×"], "ans": "○", "exp": "木瓜、龍眼等甜美果實可吸引動物採食傳播種子[cite: 8, 12, 66]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "植物在生活中的功用，除了食用外，還可以製成衣服，例如稻子的果實可以吃，棉花可以織成衣服。", "options": ["○", "×"], "ans": "○", "exp": "稻子提供食物，棉花與亞麻可製作衣物[cite: 9, 12]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "牽牛花是草本莖，莖較柔軟、無法直立，因此需要依靠其他物體來攀爬生長。", "options": ["○", "×"], "ans": "×", "exp": "牽牛花與絲瓜莖較柔軟、無法直立，屬於「藤本莖」而非草本莖[cite: 4, 29]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "是非題", "q": "所有植物都在春季開花，其他季節都沒有植物開花。", "options": ["○", "×"], "ans": "×", "exp": "一年四季都有不同植物開花，如夏季荷花/金針花、秋季臺灣欒樹、冬季梅花[cite: 7, 29]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "在自然環境常見的生物中，下列哪一種是植物？", "options": ["①高大的榕樹", "②飛舞的蝴蝶", "③吃蟲的小鳥", "④游水的魚"], "ans": "①高大的榕樹", "exp": "蝴蝶、小鳥、魚屬於動物，榕樹屬於植物[cite: 12]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "黑板樹的葉子在同一個節上輪狀長出多片葉子，請問它屬於哪一種生長方式（葉序）？", "options": ["①互生", "②對生", "③輪生", "④單生"], "ans": "③輪生", "exp": "黑板樹與軟枝黃蟬的葉序屬於輪生[cite: 2, 13, 87]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "為什麼植物的枝條都會盡量向上、向外交錯生長呢？", "options": ["①爭取更多陽光", "②幫助吸收水分", "③呼吸更多空氣", "④方便吸取其他植物的養分"], "ans": "①爭取更多陽光", "exp": "枝條向外、向上交錯生長，能讓葉子照到更多陽光以製造養分[cite: 2, 13]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "牽牛花的莖屬於藤本莖，它具有下列哪一項特徵？", "options": ["①較粗壯", "②能支撐植物直立", "③表面具有瘤刺", "④可以依附在其他物體上攀爬"], "ans": "④可以依附在其他物體上攀爬", "exp": "藤本莖柔軟無法直立，需依附其他物體攀爬生長[cite: 4, 13]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "下列哪一項「不是」植物根的功能？", "options": ["①幫助固定植物", "②吸引蜜蜂前來採食", "③幫助植物向上生長", "④吸收土壤裡的水分"], "ans": "②吸引蜜蜂前來採食", "exp": "吸引蜜蜂採食是「花」的功能，不是根的功能[cite: 5, 7, 13]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "臺灣欒樹像氣球一樣的果實具有下列哪一項功能？", "options": ["①吸收土壤裡的水分", "②爭取更多陽光", "③幫助傳播種子", "④支撐植物的身體"], "ans": "③幫助傳播種子", "exp": "果實可以保護種子，並隨風飄揚幫助傳播種子[cite: 8, 13]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "下列哪一種植物的莖屬於木本莖，比較適合當作製作木桌、木櫃的材料？", "options": ["①長春花", "②樟樹", "③牽牛花", "④絲瓜"], "ans": "②樟樹", "exp": "樟樹是粗壯的木本莖，適合製作家具；長春花是草本莖，牽牛花與絲瓜是藤本莖[cite: 3, 4, 13, 87]。"},
+    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "黑板樹的葉子在枝條同一個節上長出多片葉子，請問它屬於哪一種生長方式？", "options": ["①互生", "②對生", "③輪生", "④單生"], "ans": "③輪生", "exp": "黑板樹與軟枝黃蟬的葉序屬於輪生[cite: 2, 13, 87]。"},
     {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "為什麼小花蔓澤蘭將樹木包覆起來後，會導致樹木死亡？", "options": ["①會使樹木照不到陽光", "②會吃掉樹木的花", "③會搶走樹木的水分", "④會引來啃食樹木的動物"], "ans": "①會使樹木照不到陽光", "exp": "小花蔓澤蘭包覆樹木後，樹葉照不到陽光無法製造足夠養分而死亡，可切斷它的莖或連根拔除[cite: 14]。"},
-    {"unit": "單元1：多采多姿的植物", "type": "選擇題", "q": "植物要繁衍後代，須要將雄蕊頂端的花粉傳播到下列哪一個構造？", "options": ["①花萼", "②花瓣", "③雄蕊", "④雌蕊"], "ans": "④雌蕊", "exp": "雄蕊頂端有花粉，傳到雌蕊上才能結出果實繁衍後代[cite: 7, 66]。"},
-
-    # --- 第二單元：生活中的力 ---
-    {"unit": "單元2：生活中的力", "type": "是非題", "q": "物體受力時，運動狀態或形狀都有可能改變。", "options": ["○", "×"], "ans": "○", "exp": "力能使物體形狀改變或運動狀態（變快、變慢、停止）改變[cite: 15, 24, 26]。"},
-    {"unit": "單元2：生活中的力", "type": "是非題", "q": "力的三要素是指力的大小、方向和作用點。", "options": ["○", "×"], "ans": "○", "exp": "線段長短表大小、箭頭表方向、接觸位置表作用點[cite: 16, 24, 26]。"},
     {"unit": "單元2：生活中的力", "type": "是非題", "q": "U形磁鐵中間和兩端的磁力強弱都相同。", "options": ["○", "×"], "ans": "×", "exp": "同一個磁鐵不同部位磁力強弱不同，兩端（磁極 N、S）磁力最強[cite: 18, 26, 68]。"},
-    {"unit": "單元2：生活中的力", "type": "是非題", "q": "將兩個圓形磁鐵的 N 極和 S 極互相靠近，兩個磁鐵會吸住。", "options": ["○", "×"], "ans": "○", "exp": "磁鐵具有同極相斥、異極相吸的特性[cite: 19, 26]。"},
     {"unit": "單元2：生活中的力", "type": "是非題", "q": "磁鐵可以吸在黑板上，表示黑板裡面一定有磁鐵的構造。", "options": ["○", "×"], "ans": "×", "exp": "磁鐵能吸在黑板上，是因為黑板含有「鐵」的成分，不一定有磁鐵[cite: 17, 26]。"},
-    {"unit": "單元2：生活中的力", "type": "是非題", "q": "利用磁鐵的特性，可以將鐵粉和沙土分離。", "options": ["○", "×"], "ans": "○", "exp": "磁鐵能吸住鐵粉而不吸沙土，可快速分離物質[cite: 19, 26]。"},
-    {"unit": "單元2：生活中的力", "type": "是非題", "q": "原本會沉在水中的膠泥，只要將形狀改變成長條形，就可以浮在水面上。", "options": ["○", "×"], "ans": "×", "exp": "長條形、球形膠泥仍會沉入水底，要捏成「容器形狀」（如船形、碗形、杯子形）才容易浮在水面上[cite: 22, 26, 27]。"},
     {"unit": "單元2：生活中的力", "type": "是非題", "q": "將皮球和硬幣放入水中後，發現硬幣會沉入水中，是因為它沒有受到水的浮力。", "options": ["○", "×"], "ans": "×", "exp": "放入水中的物體都會受到向上的浮力，硬幣沉下去是因為浮力不夠支撐其重量[cite: 21, 29, 69]。"},
-    {"unit": "單元2：生活中的力", "type": "選擇題", "q": "磁鐵能吸住下列哪一項物品？", "options": ["①膠帶", "②彩色筆", "③十元硬幣", "④釘書針"], "ans": "④釘書針", "exp": "釘書針、迴紋針、長尾夾、剪刀刀刃為鐵製品，可被磁鐵吸住[cite: 17, 26]。"},
-    {"unit": "單元2：生活中的力", "type": "選擇題", "q": "小恩用長尾夾、橡皮擦、色紙、鐵尺、迴紋針和十元硬幣測試磁鐵，請問有幾種物品「無法」被磁鐵吸住？", "options": ["①2種", "②3種", "③4種", "④5種"], "ans": "②3種", "exp": "無法被吸住的有：橡皮擦、色紙、十元硬幣，共3種（長尾夾、鐵尺、迴紋針含鐵可被吸住）[cite: 17, 30]。"},
-    {"unit": "單元2：生活中的力", "type": "選擇題", "q": "下列關於磁鐵的敘述，哪一項是「不正確」的？", "options": ["①每個磁鐵都有兩個磁極", "②磁鐵能吸住所有的金屬製品", "③兩個磁鐵的相同磁極靠近會互相排斥", "④將兩個磁鐵互相靠近可能有相吸或相斥現象"], "ans": "②磁鐵能吸住所有的金屬製品", "exp": "磁鐵只能吸住鐵製品，不能吸住銅、鋁、十元硬幣等其他金屬[cite: 17, 26, 92]。"},
-    {"unit": "單元2：生活中的力", "type": "選擇題", "q": "下列有關各種力的敘述，哪一項是「不正確」的？", "options": ["①浮力可以讓船浮在水面上", "②風力可以讓風箏飛起", "③磁鐵利用磁力將紙條固定在冰箱門上", "④彈力可以讓水車轉動"], "ans": "④彈力可以讓水車轉動", "exp": "水車轉動是利用流動的「水傳送動力」，而非彈力[cite: 23, 27]。"},
-    {"unit": "單元2：生活中的力", "type": "選擇題", "q": "下列哪一種現象和「水傳送動力」有關？", "options": ["①用浮板學游泳", "②風箏在空中飄揚", "③用磁鐵將門固定在門擋上", "④用水槍玩具將空罐射倒"], "ans": "④用水槍玩具將空罐射倒", "exp": "手壓水槍的力量透過水傳送出去射倒空罐，與水車轉動、水柱沖洗地面同屬水傳送動力[cite: 23, 27, 31]。"},
-    {"unit": "單元2：生活中的力", "type": "選擇題", "q": "整塊膠泥放入水中會沉到水底，如果將膠泥捏成下列形狀再放入水中，哪一種形狀還是會沉到水底？", "options": ["①船形", "②碗形", "③長條形", "④杯子形"], "ans": "③長條形", "exp": "船形、碗形、杯子形皆為容器形狀可浮於水面，長條形會沉到水底[cite: 22, 27]。"},
-
-    # --- 第三單元：奇妙的空氣 ---
-    {"unit": "單元3：奇妙的空氣", "type": "是非題", "q": "把粉筆放進水裡會看到氣泡冒出來，是因為粉筆的縫隙裡有空氣。", "options": ["○", "×"], "ans": "○", "exp": "海綿與粉筆的縫隙裡有空氣，放入水中會冒出氣泡[cite: 33, 43]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "是非題", "q": "我們可以看見石頭、水等物質，它們都占有空間，但空氣看不見，所以空氣不占有空間。", "options": ["○", "×"], "ans": "×", "exp": "空氣雖然看不見，但從杯底紙團壓入水中不溼、鼓起的塑膠袋等實驗可證明空氣占有空間[cite: 34, 41, 43]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "是非題", "q": "往前推動裝滿空氣的注射筒活塞，會使注射筒前端的紙條飄起，是因為空氣流動形成風。", "options": ["○", "×"], "ans": "○", "exp": "空氣從筒口流出來形成風，使紙條飄動[cite: 36, 43]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "是非題", "q": "因為空氣看不見，所以風的強弱是無法透過觀察而知道的。", "options": ["○", "×"], "ans": "×", "exp": "可藉由觀察國旗或頭髮飄揚高度、風車轉動快慢來判斷風的強弱[cite: 36, 42, 43]。"},
+    {"unit": "單元2：生活中的力", "type": "選擇題", "q": "整塊膠泥放入水中會沉到水底，如果將膠泥捏成下列形狀再放入水中，哪一種形狀還是會沉到水底？", "options": ["①船形", "②碗形", "③長條形", "④杯子形"], "ans": "③長條形", "exp": "船形、碗形、杯子形皆為容器形狀可浮於水面，長條形與球形會沉到水底[cite: 22, 27]。"},
     {"unit": "單元3：奇妙的空氣", "type": "是非題", "q": "游泳圈利用空氣會流動、可以被壓縮等特性，幫助我們浮在水面上。", "options": ["○", "×"], "ans": "×", "exp": "游泳圈是利用空氣「占有空間、沒有固定形狀」以及「水的浮力」幫助我們浮在水面上[cite: 34, 41, 43, 90]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "是非題", "q": "垃圾放久會產生臭味，只要將垃圾燃燒，就可以避免空氣品質被汙染。", "options": ["○", "×"], "ans": "×", "exp": "燃燒垃圾、廢棄物與稻草會產生濃煙和臭味，嚴重汙染空氣[cite: 39, 60]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "選擇題", "q": "下列哪一個現象可以證明「空氣占有空間」？", "options": ["①國旗飄動", "②杯子會沉入水中", "③水槍可以噴水", "④捏起來鼓鼓的塑膠袋"], "ans": "④捏起來鼓鼓的塑膠袋", "exp": "揮動塑膠袋抓到空氣後變得鼓鼓的，證明空氣占有空間[cite: 32, 41, 43]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "選擇題", "q": "下列哪一項物品是利用「空氣占有空間、沒有固定形狀」的特性設計的，可以避免物品碰撞損壞？", "options": ["①氣泡袋", "②毛巾", "③紙袋", "④原子筆"], "ans": "①氣泡袋", "exp": "充滿空氣的氣泡袋與餅乾包裝能保護物品避免碰撞損壞或碎裂[cite: 34, 41, 43]。"},
     {"unit": "單元3：奇妙的空氣", "type": "選擇題", "q": "將裝滿空氣的注射筒筒口抵住橡皮擦後，用力向下壓活塞再放手，活塞會出現什麼現象？", "options": ["①往上移動（回到原來位置）", "②繼續往下移動", "③停在壓下的位置", "④先往下再往上移動"], "ans": "①往上移動（回到原來位置）", "exp": "空氣可被壓縮，放手後被壓縮的空氣會推著活塞往上回到原來位置[cite: 38, 60]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "選擇題", "q": "承上題，將注射筒筒口抵住橡皮擦向下擠壓活塞的實驗過程中，「沒有」利用到空氣的哪一個特性？", "options": ["①占有空間", "②可以被壓縮", "③會流動形成風", "④沒有固定形狀"], "ans": "③會流動形成風", "exp": "筒口被橡皮擦堵住，空氣在筒內被壓縮，沒有流出形成風[cite: 37, 44]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "選擇題", "q": "下列哪一項物品是利用「空氣可以被壓縮、傳送力量，使物體移動」的特性設計而成？", "options": ["①釣魚遊戲", "②簡易空氣發射器", "③紙風車", "④游泳圈"], "ans": "②簡易空氣發射器", "exp": "簡易空氣發射器與空氣槍玩具利用壓縮空氣傳送力量把胡蘿蔔片發射出去[cite: 38, 44]。"},
-    {"unit": "單元3：奇妙的空氣", "type": "選擇題", "q": "下列哪一種作法「無法」維護空氣的清新和乾淨？", "options": ["①少砍伐，多種樹", "②用較環保、低汙染的方式發電", "③多搭乘大眾運輸工具", "④工廠任意排放廢氣"], "ans": "④工廠任意排放廢氣", "exp": "工廠與汽機車排放廢氣會造成空氣汙染[cite: 39, 40, 44]。"},
-
-    # --- 第四單元：廚房裡的科學 ---
-    {"unit": "單元4：廚房裡的科學", "type": "是非題", "q": "食鹽、小蘇打粉、黑胡椒粒和檸檬酸，都能完全溶解在水中。", "options": ["○", "×"], "ans": "×", "exp": "黑胡椒粒不能完全溶解在水中，會有顆粒沉澱[cite: 48, 55, 57]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "是非題", "q": "在紅茶中加入太多砂糖，發現砂糖沉澱在杯子底部時，可以將紅茶加熱，就能溶解杯底的砂糖。", "options": ["○", "×"], "ans": "○", "exp": "提高水溫（或增加水量）可以增加物質在水中溶解的量[cite: 52, 56, 57]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "是非題", "q": "醋聞起來有酸酸的氣味，紫色高麗菜汁加入後，會變成偏紅色。", "options": ["○", "×"], "ans": "○", "exp": "醋與檸檬酸水是酸性水溶液，加入紫色高麗菜汁會變成偏紅色[cite: 54, 56, 57]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "是非題", "q": "將紫色高麗菜汁加入檸檬酸水中，水溶液的顏色維持紫色，表示檸檬酸水是中性水溶液。", "options": ["○", "×"], "ans": "×", "exp": "檸檬酸水是酸性水溶液，加入紫色高麗菜汁會變成「偏紅色」；食鹽水與砂糖水才是維持紫色的中性水溶液[cite: 54, 56, 57, 60]。"},
     {"unit": "單元4：廚房裡的科學", "type": "是非題", "q": "有一種白色的粉末材料，聞起來沒有特別的氣味，摸起來細細的，加入水中能完全溶解，這種材料可能是食鹽。", "options": ["○", "×"], "ans": "×", "exp": "摸起來「細細的」白色粉末是「小蘇打粉」；食鹽與檸檬酸摸起來是「粗粗的」顆粒狀[cite: 47, 57]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "是非題", "q": "讀取量筒中的水量時，眼睛要平視水位中央最低處的刻度，水量才準確。", "options": ["○", "×"], "ans": "○", "exp": "量筒讀數需平視水位中央最低處刻度[cite: 48, 73, 94]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "利用感官觀察某一種材料，它看起來是白色，聞起來沒有氣味，摸起來是粗粗的顆粒，可能是下列哪一種材料？", "options": ["①黑胡椒粒", "②砂糖", "③檸檬酸（或食鹽）", "④小蘇打粉"], "ans": "③檸檬酸（或食鹽）", "exp": "檸檬酸與食鹽皆為白色、粗顆粒、無氣味；小蘇打粉為細粉末，砂糖有甜味，黑胡椒粒為深棕色有辛辣味[cite: 47, 57]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "將食鹽加到水中，會慢慢看不見顆粒，與水均勻混合成食鹽水，這種現象稱為什麼？", "options": ["①溶解", "②分離", "③合併", "④結冰"], "ans": "①溶解", "exp": "顆粒在水中看不見、與水均勻混合的現象稱為溶解[cite: 47, 55, 57]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "下列哪一種方法可以增加食鹽在水中溶解的量？", "options": ["①提高水溫（或增加水量）", "②加入砂糖", "③用電風扇吹", "④放入冰箱中"], "ans": "①提高水溫（或增加水量）", "exp": "提高水溫與增加水量可增加溶解量；攪拌只能加快溶解速度[cite: 52, 56, 57]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "下列哪一項「不是」溶解現象的應用？", "options": ["①在湯中加入食鹽調味", "②船形膠泥浮在水面上", "③在水中加入小蘇打粉清潔餐具", "④在檸檬汁中加入糖"], "ans": "②船形膠泥浮在水面上", "exp": "船形膠泥浮在水面上是「水的浮力」與物體形狀的應用，而非溶解[cite: 22, 49, 58]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "在相同水量的熱水、常溫水和冰水中，加入等量的食鹽，充分攪拌後發現 3 杯杯底都有食鹽沉澱，哪一杯已溶解的食鹽量最多？", "options": ["①熱水", "②常溫水", "③冰水", "④3杯溶解的量一樣多"], "ans": "①熱水", "exp": "水溫越高，食鹽可溶解的量越多，杯底剩餘沉澱越少[cite: 52, 56, 58]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "將紫色高麗菜汁滴入下列哪一種水溶液，可能會呈現「偏藍綠色」？", "options": ["①砂糖水", "②食鹽水", "③醋", "④小蘇打水"], "ans": "④小蘇打水", "exp": "小蘇打水為鹼性，加入紫色高麗菜汁呈偏藍綠色；砂糖水與食鹽水為中性呈紫色；醋與檸檬酸水為酸性呈偏紅色[cite: 54, 56, 58]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "下列哪一種方法可以較準確且安全的分辨「食鹽」和「檸檬酸」？", "options": ["①嘗味道", "②觀察顏色", "③測試能不能完全溶於水", "④製作成水溶液後，加入紫色高麗菜汁觀察顏色變化"], "ans": "④製作成水溶液後，加入紫色高麗菜汁觀察顏色變化", "exp": "食鹽與檸檬酸皆為白色粗顆粒且皆能完全溶於水，不可嘗味道；加入紫色高麗菜汁後，食鹽水維持紫色，檸檬酸水變偏紅色[cite: 47, 54, 58]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "利用物質溶解的特性，可以將下列哪兩項混在一起的物質分離？", "options": ["①黑胡椒粒、沙土", "②食鹽、沙土", "③砂糖、小蘇打粉", "④食鹽、檸檬酸"], "ans": "②食鹽、沙土", "exp": "食鹽能完全溶於水，沙土不能溶於水，加水過濾即可分離[cite: 49, 55, 61]。"},
-    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "小翔將蝶豆花晶球加入不同飲料中：冰水與砂糖水呈藍色、汽水與檸檬汁呈紫紅色、小蘇打水呈綠色。若要讓晶球有味道但「不會變色」，可用哪一種材料調味？", "options": ["①醋", "②小蘇打粉", "③砂糖", "④汽水"], "ans": "③砂糖", "exp": "砂糖水為中性，與冰水一樣維持藍色不變色，且有甜味[cite: 59]。"}
+    {"unit": "單元4：廚房裡的科學", "type": "選擇題", "q": "下列哪一種方法可以較準確且安全的分辨「食鹽」和「檸檬酸」？", "options": ["①嘗味道", "②觀察顏色", "③測試能不能完全溶於水", "④製作成水溶液後，加入紫色高麗菜汁觀察顏色變化"], "ans": "④製作成水溶液後，加入紫色高麗菜汁觀察顏色變化", "exp": "食鹽水加入紫色高麗菜汁維持紫色（中性），檸檬酸水則變成偏紅色（酸性）[cite: 47, 54, 58]。"}
 ]
 
 
 # ==========================================
-# 3. PDF 自動解析與紅/藍解答濾除工具函數
+# 6. 智慧型 PDF 全題型解析與擦除紅藍解答工具
 # ==========================================
 def clean_pdf_text(raw_text: str) -> str:
     """清除康軒 PDF 內嵌注音符號與浮水印雜訊"""
-    # 移除注音符號與聲調符號 (保留題目中獨立作為代號的 ㄅㄆㄇㄈ)
     cleaned = re.sub(r'(?<=[\u4e00-\u9fff])[\u3105-\u3129\u02CA\u02C7\u02CB\u02D9ˊˇˋ˙]+', '', raw_text)
     cleaned = re.sub(r'xyz88\.\w+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'有著作權.*?必究\s*\d*', '', cleaned)
     return cleaned
 
 
-def parse_questions_from_pdf(pdf_bytes: bytes, source_name: str) -> list:
-    """從上傳的 PDF 自動擷取是非題與選擇題"""
+def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page: int = None) -> list:
+    """
+    從上傳的 PDF 自動擷取：
+    1. 是非題 (○ / ×)
+    2. 選擇題 (① / ② / ③ / ④)
+    3. 填充與代號題 (括號內紅/藍字解答或代號)
+    4. 勾選題 (□ 打 √)
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     parsed_list = []
 
-    for page_idx, page in enumerate(doc):
+    pages_to_scan = [target_page] if target_page is not None else range(len(doc))
+
+    for page_idx in pages_to_scan:
+        if page_idx < 0 or page_idx >= len(doc):
+            continue
+        page = doc.load_page(page_idx)
         text = clean_pdf_text(page.get_text("text"))
         lines = [line.strip() for line in text.split('\n') if line.strip()]
         joined_text = " ".join(lines)
+        unit_label = f"考卷：{source_name} (第{page_idx+1}頁)"
 
-        # 1. 解析是非題: (○)1.題目 或 (×)2.題目 或 ( )1.題目
+        # 1. 解析是非題
         tf_pattern = re.compile(r'[\(（]\s*([○◯O×X✕✓√]?)\s*[\)）]\s*(\d+)\s*[\.、]\s*([^()（）①②③④]+?[。？\?])')
         for match in tf_pattern.finditer(joined_text):
             raw_ans, q_num, q_body = match.groups()
@@ -649,15 +1162,17 @@ def parse_questions_from_pdf(pdf_bytes: bytes, source_name: str) -> list:
                 continue
             ans = "○" if raw_ans in ["○", "◯", "O", "✓", "√"] else ("×" if raw_ans in ["×", "X", "✕"] else "○")
             parsed_list.append({
-                "unit": f"匯入：{source_name} (第{page_idx+1}頁)",
+                "unit": unit_label,
+                "pdf_name": source_name,
+                "page_num": page_idx + 1,
                 "type": "是非題",
-                "q": f"({q_num}) {q_body}",
+                "q": f"是非第 {q_num} 題：{q_body}",
                 "options": ["○", "×"],
                 "ans": ans,
-                "exp": f"來源：{source_name} 第 {page_idx+1} 頁（若原卷解答為特殊圖層，可於下方表格微調答案）"
+                "exp": f"來源：{source_name} 第 {page_idx+1} 頁"
             })
 
-        # 2. 解析選擇題: (①)1.題目 ①選項1 ②選項2 ③選項3 ④選項4
+        # 2. 解析選擇題
         mc_pattern = re.compile(
             r'[\(（]\s*([①②③④1234]?)\s*[\)）]\s*(\d+)\s*[\.、]\s*(.+?)\s*[①1]\s*([^②③④]+?)\s*[②2]\s*([^③④]+?)\s*[③3]\s*([^④]+?)\s*[④4]\s*([^①②③④\(（]+?[。？\?]?)'
         )
@@ -673,19 +1188,48 @@ def parse_questions_from_pdf(pdf_bytes: bytes, source_name: str) -> list:
             ans_map = {"①": opts[0], "1": opts[0], "②": opts[1], "2": opts[1], "③": opts[2], "3": opts[2], "④": opts[3], "4": opts[3]}
             ans_val = ans_map.get(raw_ans, opts[0])
             parsed_list.append({
-                "unit": f"匯入：{source_name} (第{page_idx+1}頁)",
+                "unit": unit_label,
+                "pdf_name": source_name,
+                "page_num": page_idx + 1,
                 "type": "選擇題",
-                "q": f"({q_num}) {q_stem}",
+                "q": f"選擇第 {q_num} 題：{q_stem}",
                 "options": opts,
                 "ans": ans_val,
                 "exp": f"來源：{source_name} 第 {page_idx+1} 頁"
             })
 
+        # 3. 解析做一做／素養題中的括號填充題 (如：屬於(藤本)莖、應為(S)極、溶解(3)平匙)
+        fill_pattern = re.compile(r'([^。；！？\n]{4,35}?[\(（]\s*([A-DSNsN甲乙丙丁藤本磁極快慢34813不可以]+)\s*[\)）][^。；！？\n]{0,20}?[。？])')
+        blanks_found = []
+        for match in fill_pattern.finditer(joined_text):
+            full_sent, ans_token = match.groups()
+            full_sent_clean = re.sub(r'\s+', '', full_sent)
+            ans_token = ans_token.strip()
+            # 排除已抓過的是非選擇題號
+            if re.match(r'^[\(（][○×①②③④1234][\)）]\d+\.', full_sent_clean):
+                continue
+            masked_sent = re.sub(r'[\(（]\s*' + re.escape(ans_token) + r'\s*[\)）]', '【 ＿＿ 】', full_sent_clean, count=1)
+            blanks_found.append({
+                "label": masked_sent,
+                "options": None,
+                "ans": ans_token
+            })
+        if blanks_found:
+            parsed_list.append({
+                "unit": unit_label,
+                "pdf_name": source_name,
+                "page_num": page_idx + 1,
+                "type": "填充與代號題",
+                "q": f"【本頁做一做／填充與代號題】（共 {len(blanks_found)} 格）",
+                "blanks": blanks_found,
+                "exp": f"來源：{source_name} 第 {page_idx+1} 頁填充與代號解析"
+            })
+
     return parsed_list
 
 
-def render_pdf_page_image(pdf_bytes: bytes, page_num: int, hide_answers: bool = False, zoom: float = 2.0) -> Image.Image:
-    """將 PDF 指定頁轉為高畫質圖片，支援一鍵濾除教師版紅/藍解答字體與連線"""
+def render_pdf_page_image(pdf_bytes: bytes, page_num: int, hide_answers: bool = False, zoom: float = 2.2) -> Image.Image:
+    """將 PDF 轉為高解析圖片，並可一鍵濾除教師版紅/藍解答字體與連線"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc.load_page(page_num)
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -694,84 +1238,212 @@ def render_pdf_page_image(pdf_bytes: bytes, page_num: int, hide_answers: bool = 
     if hide_answers:
         arr = np.array(img, dtype=np.int16)
         r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-
-        # 偵測教師用卷常見的紅色/桃紅色解答標記 (校用卷、重點複習)
-        red_mask = (r > 145) & ((r - g) > 28) & ((r - b) > 18)
-        # 偵測月考卷常見的藍色解答標記 (月考A/B卷、期中考A/B卷)
-        blue_mask = (b > 135) & ((b - r) > 28) & ((b - g) > 12)
-
-        combined_mask = red_mask | blue_mask
-        arr[combined_mask] = [255, 255, 255]
+        # 濾除教師用解答常見的紅色/桃紅與藍色筆跡與連線
+        red_mask = (r > 140) & ((r - g) > 25) & ((r - b) > 15)
+        blue_mask = (b > 130) & ((b - r) > 25) & ((b - g) > 10)
+        arr[red_mask | blue_mask] = [255, 255, 255]
         img = Image.fromarray(arr.astype(np.uint8))
 
     return img
 
 
 # ==========================================
-# Session State 初始化
+# 7. 互動題目渲染與自動批改核心函數（支援 5 大題型）
 # ==========================================
-if "quiz_bank" not in st.session_state:
-    st.session_state.quiz_bank = list(DEFAULT_QUIZ_BANK)
-if "wrong_questions" not in st.session_state:
-    st.session_state.wrong_questions = []
-if "uploaded_pdfs" not in st.session_state:
-    st.session_state.uploaded_pdfs = {}  # {filename: bytes}
-if "score_history" not in st.session_state:
-    st.session_state.score_history = []
+def render_interactive_question(idx: int, item: dict, form_prefix: str):
+    """在畫面上渲染單一題目（支援是非、選擇、勾選、填充代號、連連看）"""
+    q_type = item.get("type", "選擇題")
+    st.markdown(
+        f'<div class="q-box">第 {idx+1} 題 <span style="font-size:0.85em; color:#2563eb;">[{item.get("unit","")}] [{q_type}]</span><br>{clean_cite(item["q"])}</div>',
+        unsafe_allow_html=True
+    )
+
+    if q_type in ["是非題", "選擇題"]:
+        st.radio(
+            f"作答_{form_prefix}_{idx}",
+            item["options"],
+            index=None,
+            key=f"{form_prefix}_q_{idx}",
+            label_visibility="collapsed",
+            horizontal=(q_type == "是非題")
+        )
+
+    elif q_type == "勾選題":
+        st.caption("👇 請在符合的項目打 √（可複選）：")
+        cols = st.columns(2)
+        for opt_i, opt_label in enumerate(item["options"]):
+            with cols[opt_i % 2]:
+                st.checkbox(
+                    clean_cite(opt_label),
+                    key=f"{form_prefix}_q_{idx}_chk_{opt_i}"
+                )
+
+    elif q_type == "填充與代號題":
+        st.caption("👇 請在下方各小題填入正確文字或選擇正確代號：")
+        for b_i, b_item in enumerate(item.get("blanks", [])):
+            b_label = clean_cite(b_item["label"])
+            if b_item.get("options"):
+                st.selectbox(
+                    b_label,
+                    ["-- 請選擇答案 --"] + b_item["options"],
+                    key=f"{form_prefix}_q_{idx}_blank_{b_i}"
+                )
+            else:
+                st.text_input(
+                    b_label,
+                    placeholder="請直接輸入答案...",
+                    key=f"{form_prefix}_q_{idx}_blank_{b_i}"
+                )
+
+    elif q_type == "連連看":
+        st.caption("👇 請為左邊的每一個項目選擇右邊對應的連線目標（選完後下方會即時畫出連線！）：")
+        left_items = item.get("left_items", [])
+        right_items = item.get("right_items", [])
+        current_pairs = {}
+        cols = st.columns(2)
+        for l_i, l_text in enumerate(left_items):
+            with cols[l_i % 2]:
+                sel = st.selectbox(
+                    f"🔗 {clean_cite(l_text)} 連到 👉",
+                    ["-- 請選擇連線對象 --"] + right_items,
+                    key=f"{form_prefix}_q_{idx}_match_{l_i}"
+                )
+                if sel != "-- 請選擇連線對象 --":
+                    current_pairs[l_text] = sel
+        render_svg_matching(left_items, right_items, current_pairs, show_grading=False)
+
+
+def grade_interactive_question(idx: int, item: dict, form_prefix: str) -> tuple:
+    """
+    自動批改單一題目，回傳 (is_all_correct: bool, user_ans_summary: str, correct_ans_summary: str)
+    """
+    q_type = item.get("type", "選擇題")
+
+    if q_type in ["是非題", "選擇題"]:
+        u_ans = st.session_state.get(f"{form_prefix}_q_{idx}")
+        is_ok = (u_ans == item["ans"])
+        return is_ok, (u_ans if u_ans else "未作答"), item["ans"]
+
+    elif q_type == "勾選題":
+        chosen = []
+        for opt_i, opt_label in enumerate(item["options"]):
+            if st.session_state.get(f"{form_prefix}_q_{idx}_chk_{opt_i}", False):
+                chosen.append(opt_label)
+        expected = item["ans"]
+        is_ok = (set(chosen) == set(expected))
+        u_str = "、".join(chosen) if chosen else "未勾選"
+        c_str = "、".join(expected)
+        return is_ok, u_str, c_str
+
+    elif q_type == "填充與代號題":
+        blanks = item.get("blanks", [])
+        all_ok = True
+        u_parts = []
+        c_parts = []
+        for b_i, b_item in enumerate(blanks):
+            raw_val = st.session_state.get(f"{form_prefix}_q_{idx}_blank_{b_i}", "")
+            u_val = "" if raw_val == "-- 請選擇答案 --" else str(raw_val).strip()
+            ans_val = str(b_item["ans"]).strip()
+            # 寬鬆比對：完全相同，或標準答案包含於選項代號中
+            sub_ok = (u_val.upper() == ans_val.upper()) or (u_val != "" and (ans_val in u_val or u_val in ans_val))
+            if not sub_ok:
+                all_ok = False
+            u_parts.append(f"({b_i+1}) {u_val if u_val else '未填'}{'✔️' if sub_ok else '❌'}")
+            c_parts.append(f"({b_i+1}) {ans_val}")
+        return all_ok, " ｜ ".join(u_parts), " ｜ ".join(c_parts)
+
+    elif q_type == "連連看":
+        left_items = item.get("left_items", [])
+        right_items = item.get("right_items", [])
+        expected_map = item.get("ans", {})
+        user_map = {}
+        all_ok = True
+        u_parts = []
+        c_parts = []
+        for l_i, l_text in enumerate(left_items):
+            sel = st.session_state.get(f"{form_prefix}_q_{idx}_match_{l_i}", "-- 請選擇連線對象 --")
+            u_val = "" if sel == "-- 請選擇連線對象 --" else sel
+            if u_val:
+                user_map[l_text] = u_val
+            exp_val = expected_map.get(l_text, "")
+            sub_ok = (u_val == exp_val)
+            if not sub_ok:
+                all_ok = False
+            u_parts.append(f"{l_text}➔{u_val if u_val else '未連'}{'✔️' if sub_ok else '❌'}")
+            c_parts.append(f"{l_text}➔{exp_val}")
+        # 顯示批改後的連線圖（綠線正確，紅虛線錯誤）
+        render_svg_matching(left_items, right_items, user_map, correct_pairs=expected_map, show_grading=True)
+        return all_ok, " ； ".join(u_parts), " ； ".join(c_parts)
+
+    return False, "未知題型", ""
 
 
 # ==========================================
-# 側邊欄導覽與學習統計
+# 8. 側邊欄導覽、字體放大控制與永久儲存狀態
 # ==========================================
 with st.sidebar:
     st.title("🌿 小三自然複習神器")
-    st.caption("115上 康軒版｜手機＆電腦雙棲版")
+    st.caption("115上 康軒版｜全題型作答＋自動存檔版")
+
+    font_scale = st.slider(
+        "🔍 畫面字體大小（手機/兒童推薦 125%~145%）",
+        min_value=100,
+        max_value=160,
+        value=125,
+        step=5,
+        help="向右拉動可將題目、選項按鈕、表格與重點卡片字體全面放大！"
+    )
+    apply_responsive_css(font_scale)
 
     mode = st.radio(
         "📌 選擇學習模式",
         [
             "📖 完整重點複習（含遮罩背誦）",
-            "🎮 互動題庫闖關（即時批改）",
-            "📄 考卷 PDF 遮罩＆題庫匯入",
-            "❌ 錯題複習本＆題庫管理"
+            "🎮 全題型題庫闖關（含連連看/填空）",
+            "📄 考卷 PDF 直接作答＆自動批改",
+            "❌ 錯題複習本＆永久備份管理"
         ]
     )
 
+    # 讀取資料庫最新統計
+    saved_pdfs_dict = db_load_all_pdfs()
+    custom_qs_list = db_load_custom_questions()
+    wrong_qs_list = db_load_wrong_questions()
+    combined_quiz_bank = list(DEFAULT_QUIZ_BANK) + custom_qs_list
+
     st.divider()
-    st.markdown(f"**📚 目前題庫總題數：** `{len(st.session_state.quiz_bank)}` 題")
-    st.markdown(f"**📕 待複習錯題數：** `{len(st.session_state.wrong_questions)}` 題")
-    st.markdown(f"**📂 已載入 PDF 卷數：** `{len(st.session_state.uploaded_pdfs)}` 份")
+    st.markdown(f"**📚 總題庫數：** `{len(combined_quiz_bank)}` 題")
+    st.markdown(f"**📕 錯題本數量：** `{len(wrong_qs_list)}` 題 *(已永久存檔)*")
+    st.markdown(f"**📂 已存 PDF 考卷：** `{len(saved_pdfs_dict)}` 份 *(已永久存檔)*")
 
 
 # ==========================================
 # 模式 1：完整重點複習（第一份重點複習 100% 完整呈現）
 # ==========================================
 if mode == "📖 完整重點複習（含遮罩背誦）":
-    st.header("📖 康軒國小自然 3 上｜完整重點複習")
-    st.info("💡 完整收錄第一份《重點複習》第 1～4 單元所有學習探索、重點補給站、分類比較表與實驗流程。開啟「🙈 遮罩關鍵字自測」即可在手機或電腦上進行填空背誦！")
+    st.header("📖 康軒國小自然 3 上｜第一份《重點複習》完整知識庫")
+    st.info("💡 100% 完整收錄第一份《重點複習》第 1～4 單元所有學習探索、重點補給站、分類比較表與實驗流程。開啟「🙈 遮罩關鍵字自測」即可進行填空背誦！")
 
     col_u, col_m, col_s = st.columns([2, 1.5, 2])
     with col_u:
-        selected_unit = st.selectbox("選擇單元", list(COMPLETE_REVIEW_DATA.keys()) + ["🌟 全部單元總覽"])
+        selected_unit = st.selectbox("📂 選擇複習單元", ["🌟 全部單元完整總覽"] + list(COMPLETE_REVIEW_DATA.keys()))
     with col_m:
-        hide_kw = st.toggle("🙈 遮罩【關鍵字】自測模式", value=False)
+        hide_kw = st.toggle("🙈 遮罩【關鍵字】填空自測", value=False)
     with col_s:
-        search_kw = st.text_input("🔍 關鍵字快速搜尋（如：軸根、磁極、紫色高麗菜）", "")
+        search_kw = st.text_input("🔍 關鍵字搜尋（如：軸根、磁極、紫色高麗菜）", "")
 
-    units_to_show = list(COMPLETE_REVIEW_DATA.keys()) if selected_unit == "🌟 全部單元總覽" else [selected_unit]
+    units_to_show = list(COMPLETE_REVIEW_DATA.keys()) if selected_unit == "🌟 全部單元完整總覽" else [selected_unit]
 
     for u_name in units_to_show:
         u_data = COMPLETE_REVIEW_DATA[u_name]
         st.subheader(f"{u_data['icon']} {u_name}")
 
         for act_name, act_content in u_data["activities"].items():
-            # 關鍵字過濾
             full_act_str = json.dumps(act_content, ensure_ascii=False)
             if search_kw and (search_kw not in full_act_str and search_kw not in act_name):
                 continue
 
             with st.expander(f"📌 {act_name}", expanded=True):
-                # 1. 重點條列
                 st.markdown("#### 📝 學習探索＆重點補給站")
                 for pt in act_content["points"]:
                     if search_kw and search_kw not in pt:
@@ -779,22 +1451,10 @@ if mode == "📖 完整重點複習（含遮罩背誦）":
                     rendered_pt = render_masked_text(pt, hide_kw)
                     st.markdown(f'<div class="review-card">{rendered_pt}</div>', unsafe_allow_html=True)
 
-                # 2. 比較表格
                 for tb in act_content["tables"]:
                     st.markdown(f"#### {clean_cite(tb['title'])}")
-                    cleaned_rows = []
-                    for r in tb["rows"]:
-                        cleaned_row = []
-                        for cell in r:
-                            c_str = clean_cite(cell)
-                            if hide_kw and r.index(cell) > 0:
-                                c_str = "🔒（關閉上方遮罩開關查看內容）"
-                            cleaned_row.append(c_str)
-                        cleaned_rows.append(cleaned_row)
-                    df_tb = pd.DataFrame(cleaned_rows, columns=tb["columns"])
-                    st.dataframe(df_tb, use_container_width=True, hide_index=True)
+                    render_html_table(tb["columns"], tb["rows"], hide_kw=hide_kw)
 
-                # 3. 實驗流程卡
                 if act_content["experiments"]:
                     st.markdown("#### 🔬 核心實驗室")
                     for exp in act_content["experiments"]:
@@ -812,207 +1472,338 @@ if mode == "📖 完整重點複習（含遮罩背誦）":
 
 
 # ==========================================
-# 模式 2：互動題庫闖關（即時批改＋詳解）
+# 模式 2：全題型互動題庫闖關（含連連看、填充、勾選、是非、選擇）
 # ==========================================
-elif mode == "🎮 互動題庫闖關（即時批改）":
-    st.header("🎮 互動題庫闖關練習")
+elif mode == "🎮 全題型題庫闖關（含連連看/填空）":
+    st.header("🎮 全題型互動題庫闖關（支援連連看、填充、打勾、是非、選擇）")
 
-    all_units = sorted(list(set(q["unit"] for q in st.session_state.quiz_bank)))
-    c1, c2, c3 = st.columns([2, 1.2, 1.2])
+    all_units = sorted(list(set(q["unit"] for q in combined_quiz_bank)))
+    all_types = ["全部題型", "連連看", "填充與代號題", "勾選題", "是非題", "選擇題"]
+
+    c1, c2, c3 = st.columns([2.2, 1.3, 1])
     with c1:
-        selected_quiz_units = st.multiselect("📂 選擇測驗範圍（可複選）", all_units, default=all_units)
+        selected_quiz_units = st.multiselect("📂 選擇測驗單元範圍", all_units, default=all_units)
     with c2:
-        q_type_filter = st.selectbox("題型篩選", ["全部題型", "是非題", "選擇題"])
+        q_type_filter = st.selectbox("🎯 題型篩選（可單獨練連連看或填充！）", all_types)
     with c3:
-        num_q = st.number_input("抽題數量", min_value=5, max_value=100, value=15, step=5)
+        num_q = st.number_input("抽題數量", min_value=1, max_value=100, value=10, step=5)
 
     filtered_pool = [
-        q for q in st.session_state.quiz_bank
+        q for q in combined_quiz_bank
         if q["unit"] in selected_quiz_units and (q_type_filter == "全部題型" or q["type"] == q_type_filter)
     ]
 
-    col_btn1, col_btn2 = st.columns([1, 1])
-    with col_btn1:
-        if st.button("🎲 重新隨機抽題 / 開始新測驗", use_container_width=True, type="primary"):
+    col_b1, col_b2 = st.columns(2)
+    with col_b1:
+        if st.button("🎲 隨機抽題開始新測驗", use_container_width=True, type="primary"):
             sample_size = min(int(num_q), len(filtered_pool))
-            st.session_state.current_exam = random.sample(filtered_pool, sample_size)
-            st.session_state.exam_submitted = False
-            st.session_state.user_answers = {}
-    with col_btn2:
-        if st.button("📋 載入範圍內全部題目（依序練習）", use_container_width=True):
-            st.session_state.current_exam = list(filtered_pool)
-            st.session_state.exam_submitted = False
-            st.session_state.user_answers = {}
+            st.session_state.active_quiz = random.sample(filtered_pool, sample_size) if filtered_pool else []
+    with col_b2:
+        if st.button("📋 載入範圍內全部題目（依序作答）", use_container_width=True):
+            st.session_state.active_quiz = list(filtered_pool)
 
-    if "current_exam" not in st.session_state or not st.session_state.current_exam:
+    if "active_quiz" not in st.session_state or not st.session_state.active_quiz:
         sample_size = min(int(num_q), len(filtered_pool))
-        st.session_state.current_exam = random.sample(filtered_pool, sample_size) if filtered_pool else []
-        st.session_state.exam_submitted = False
-        st.session_state.user_answers = {}
+        st.session_state.active_quiz = random.sample(filtered_pool, sample_size) if filtered_pool else []
 
-    exam_questions = st.session_state.current_exam
+    exam_questions = st.session_state.active_quiz
 
     if not exam_questions:
-        st.warning("請至少選擇一個有效的測驗範圍！")
+        st.warning("⚠️ 此篩選條件下沒有題目，請調整單元或題型篩選！")
     else:
-        st.caption(f"本次測驗共 **{len(exam_questions)}** 題，作答完畢請點擊最下方「✅ 交卷批改」。")
+        st.caption(f"👇 本次測驗共 **{len(exam_questions)}** 題。連連看與選單皆可直接點選作答，完成後請按最下方「✅ 交卷並自動批改」。")
 
-        with st.form("quiz_form"):
-            for idx, item in enumerate(exam_questions):
-                st.markdown(f"**第 {idx+1} 題** `[{item['unit']}]` `[{item['type']}]`")
-                st.markdown(f"##### {clean_cite(item['q'])}")
-                choice = st.radio(
-                    f"作答區_{idx}",
-                    item["options"],
-                    index=None,
-                    key=f"q_radio_{idx}",
-                    label_visibility="collapsed",
-                    horizontal=(item["type"] == "是非題")
-                )
-                st.divider()
+        for idx, item in enumerate(exam_questions):
+            render_interactive_question(idx, item, form_prefix="main_quiz")
+            st.divider()
 
-            submitted = st.form_submit_button("✅ 交卷批改並看詳解", use_container_width=True, type="primary")
-
-        if submitted:
+        if st.button("✅ 交卷並自動批改錯誤", type="primary", use_container_width=True):
             correct_count = 0
             total_count = len(exam_questions)
-            st.subheader("📊 批改結果與詳解")
+            st.subheader("📊 自動批改結果與詳解")
 
             for idx, item in enumerate(exam_questions):
-                u_ans = st.session_state.get(f"q_radio_{idx}")
-                is_correct = (u_ans == item["ans"])
-                if is_correct:
+                is_ok, u_ans_str, c_ans_str = grade_interactive_question(idx, item, form_prefix="main_quiz")
+                if is_ok:
                     correct_count += 1
-                    st.success(f"✔️ **第 {idx+1} 題答對！** 題目：{clean_cite(item['q'])}\n\n- 你的答案：`{u_ans}`\n- 💡 解析：{clean_cite(item['exp'])}")
+                    st.success(
+                        f"✔️ **第 {idx+1} 題【答對】！** ({item['type']})\n\n"
+                        f"- 題目：{clean_cite(item['q'])}\n"
+                        f"- 你的作答：`{u_ans_str}`\n"
+                        f"- 💡 解析：{clean_cite(item.get('exp', ''))}"
+                    )
                 else:
-                    st.error(f"❌ **第 {idx+1} 題答錯！** 題目：{clean_cite(item['q'])}\n\n- 你的答案：`{u_ans if u_ans else '未作答'}` ｜ 🎯 **正確答案：`{item['ans']}`**\n- 💡 解析：{clean_cite(item['exp'])}")
-                    if item not in st.session_state.wrong_questions:
-                        st.session_state.wrong_questions.append(item)
+                    st.error(
+                        f"❌ **第 {idx+1} 題【有誤，已自動加入錯題本】！** ({item['type']})\n\n"
+                        f"- 題目：{clean_cite(item['q'])}\n"
+                        f"- 你的作答：`{u_ans_str}`\n"
+                        f"- 🎯 **正確答案：`{c_ans_str}`**\n"
+                        f"- 💡 解析：{clean_cite(item.get('exp', ''))}"
+                    )
+                    db_add_wrong_question(item, u_ans_str)
 
             final_score = round((correct_count / total_count) * 100)
+            db_save_exam_history(f"題庫闖關 ({q_type_filter})", final_score, correct_count, total_count)
             st.metric("🏆 本次測驗得分", f"{final_score} 分", f"答對 {correct_count} / {total_count} 題")
             if final_score == 100:
                 st.balloons()
 
 
 # ==========================================
-# 模式 3：考卷 PDF 遮罩練習 ＆ 自動匯入題庫
+# 模式 3：考卷 PDF 直接作答 ＆ 自動批改
 # ==========================================
-elif mode == "📄 考卷 PDF 遮罩＆題庫匯入":
-    st.header("📄 匯入 PDF 考卷｜一鍵消去紅藍解答 ＆ 自動擷取題庫")
-    st.markdown("""
-    支援同時上傳多份 PDF 考卷（如：**校用卷_答案**、**月考 A/B 卷 (教)**、**重點複習**）：
-    1. **🪄 原卷遮罩自測模式（完美解決看圖題、連連看、勾選題）**：自動將教師版考卷上的**紅色／藍色解答字跡與連線隱藏**，秒變空白練習卷！
-    2. **🤖 自動文字題庫擷取**：自動清洗康軒版內嵌注音符號並抓出是非題、選擇題，匯入互動題庫中。
-    """)
+elif mode == "📄 考卷 PDF 直接作答＆自動批改":
+    st.header("📄 考卷 PDF 匯入｜原卷消去解答 ＋ 電腦/手機直接作答批改")
+    st.info("💡 上傳的 PDF 考卷會**自動永久儲存於資料庫**，重新整理網頁不會消失！系統會將考卷的紅/藍解答隱藏變成空白考卷，並在旁生成**互動式作答卡（是非、選擇、填充代號、勾選、連連看）**讓你直接作答與自動批改。")
 
     uploaded_files = st.file_uploader(
-        "📥 點擊或拖曳上傳一份或多份 PDF 題庫檔案",
+        "📥 上傳一份或多份 PDF 題庫/考卷（上傳後自動永久存檔並解析題目）",
         type=["pdf"],
         accept_multiple_files=True
     )
 
     if uploaded_files:
+        new_count = 0
         for uf in uploaded_files:
-            if uf.name not in st.session_state.uploaded_pdfs:
-                st.session_state.uploaded_pdfs[uf.name] = uf.read()
-        st.success(f"已成功載入 {len(st.session_state.uploaded_pdfs)} 份 PDF 檔案！")
+            if uf.name not in saved_pdfs_dict:
+                raw_bytes = uf.read()
+                db_save_pdf(uf.name, raw_bytes)
+                extracted_qs = parse_all_questions_from_pdf(raw_bytes, uf.name)
+                if extracted_qs:
+                    db_save_custom_questions(extracted_qs, pdf_name=uf.name)
+                new_count += 1
+        if new_count > 0:
+            st.success(f"🎉 成功永久儲存 {new_count} 份 PDF 並自動匯入題目！")
+            st.rerun()
 
-    if st.session_state.uploaded_pdfs:
-        tab_visual, tab_parse = st.tabs([
-            "🖼️ 原卷消除解答自測模式（支援連連看/看圖題）",
-            "🤖 自動解析文字題目並匯入題庫"
-        ])
+    saved_pdfs_dict = db_load_all_pdfs()
 
-        with tab_visual:
-            c_pdf, c_page, c_mask = st.columns([2.2, 1, 1.5])
-            with c_pdf:
-                chosen_pdf_name = st.selectbox("選擇要檢視/作答的 PDF 考卷", list(st.session_state.uploaded_pdfs.keys()))
-            pdf_bytes = st.session_state.uploaded_pdfs[chosen_pdf_name]
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            total_pages = len(doc)
+    if not saved_pdfs_dict:
+        st.warning("目前尚未上傳 PDF 考卷，請從上方上傳檔案（例如：校用卷、月考卷、重點複習）。")
+    else:
+        c_sel, c_pg, c_mask, c_del = st.columns([2.2, 1, 1.5, 1])
+        with c_sel:
+            chosen_pdf_name = st.selectbox("📂 選擇已存檔的 PDF 考卷", list(saved_pdfs_dict.keys()))
+        pdf_bytes = saved_pdfs_dict[chosen_pdf_name]
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
 
-            with c_page:
-                page_idx = st.number_input(f"頁碼 (共 {total_pages} 頁)", min_value=1, max_value=total_pages, value=1) - 1
-            with c_mask:
-                hide_ans_img = st.toggle("🪄 隱藏紅/藍解答（空白考卷模式）", value=True)
-
-            img_rendered = render_pdf_page_image(pdf_bytes, page_idx, hide_answers=hide_ans_img, zoom=2.0)
-            st.image(img_rendered, caption=f"{chosen_pdf_name} - 第 {page_idx+1} 頁 ({'空白練習模式' if hide_ans_img else '顯示解答模式'})", use_container_width=True)
-
-        with tab_parse:
-            parse_target = st.selectbox("選擇要解析匯入題庫的 PDF", ["🌟 一次解析全部已上傳 PDF"] + list(st.session_state.uploaded_pdfs.keys()))
-            if st.button("🚀 開始自動解析是非題與選擇題", type="primary"):
-                newly_parsed = []
-                targets = st.session_state.uploaded_pdfs.items() if parse_target == "🌟 一次解析全部已上傳 PDF" else [(parse_target, st.session_state.uploaded_pdfs[parse_target])]
-                for fname, fbytes in targets:
-                    extracted = parse_questions_from_pdf(fbytes, fname)
-                    newly_parsed.extend(extracted)
-                st.session_state.preview_parsed = newly_parsed
-
-            if "preview_parsed" in st.session_state and st.session_state.preview_parsed:
-                st.info(f"🔍 共解析出 **{len(st.session_state.preview_parsed)}** 題！你可在下方表格直接檢視或微調答案，再點擊「確認匯入主題庫」：")
-                df_preview = pd.DataFrame(st.session_state.preview_parsed)
-                edited_df = st.data_editor(
-                    df_preview[["unit", "type", "q", "ans", "exp"]],
-                    use_container_width=True,
-                    num_rows="dynamic"
-                )
-                if st.button("✅ 確認將這些題目加入主題庫", type="primary", use_container_width=True):
-                    for idx_r, row in edited_df.iterrows():
-                        orig_opts = st.session_state.preview_parsed[idx_r]["options"] if idx_r < len(st.session_state.preview_parsed) else ["○", "×"]
-                        st.session_state.quiz_bank.append({
-                            "unit": row["unit"],
-                            "type": row["type"],
-                            "q": row["q"],
-                            "options": orig_opts,
-                            "ans": row["ans"],
-                            "exp": row["exp"]
-                        })
-                    st.success(f"🎉 成功匯入 {len(edited_df)} 題！現在題庫共有 {len(st.session_state.quiz_bank)} 題。")
-                    del st.session_state.preview_parsed
-
-
-# ==========================================
-# 模式 4：錯題複習本 ＆ 題庫 JSON 備份管理
-# ==========================================
-elif mode == "❌ 錯題複習本＆題庫管理":
-    st.header("❌ 專屬錯題複習本 ＆ 題庫管理")
-
-    tab_wrong, tab_export = st.tabs(["📕 錯題加強複習", "💾 題庫匯出 / 匯入備份 (JSON)"])
-
-    with tab_wrong:
-        if not st.session_state.wrong_questions:
-            st.success("🎉 太棒了！目前沒有任何錯題紀錄。")
-        else:
-            st.warning(f"共有 **{len(st.session_state.wrong_questions)}** 題答錯過的題目，趕快再複習一次吧！")
-            if st.button("🗑️ 清空全部錯題紀錄"):
-                st.session_state.wrong_questions = []
+        with c_pg:
+            page_num = st.number_input(f"選擇頁碼 (1~{total_pages})", min_value=1, max_value=total_pages, value=1)
+        with c_mask:
+            hide_ans_img = st.toggle("🪄 擦除考卷紅/藍解答（空白卷）", value=True)
+        with c_del:
+            if st.button("🗑️ 刪除此份 PDF"):
+                db_delete_pdf(chosen_pdf_name)
                 st.rerun()
 
-            for i, wq in enumerate(st.session_state.wrong_questions):
-                with st.expander(f"錯題 {i+1}：[{wq['unit']}] {clean_cite(wq['q'])}", expanded=True):
-                    st.markdown(f"- **選項：** `{' / '.join(wq['options'])}`")
-                    st.markdown(f"- 🎯 **正確答案：** `{wq['ans']}`")
-                    st.markdown(f"- 💡 **重點解析：** {clean_cite(wq['exp'])}")
+        # 左右分欄（電腦上左邊看空白考卷圖、右邊直接作答；手機上自動上下排列）
+        col_img, col_ans_sheet = st.columns([1.15, 1])
 
-    with tab_export:
-        st.subheader("📤 匯出完整題庫 (JSON)")
-        st.caption("將包含新上傳 PDF 解析出的題庫下載保存，下次開啟或換手機時可直接匯入。")
-        json_str = json.dumps(st.session_state.quiz_bank, ensure_ascii=False, indent=2)
+        with col_img:
+            st.subheader(f"📄 考卷畫面（第 {page_num} 頁）")
+            img_rendered = render_pdf_page_image(pdf_bytes, page_num - 1, hide_answers=hide_ans_img, zoom=2.2)
+            st.image(img_rendered, use_container_width=True)
+
+        with col_ans_sheet:
+            st.subheader(f"✍️ 第 {page_num} 頁｜直接作答與自動批改區")
+
+            # 取得該頁自動解析出的題目 + 使用者為該頁新增的互動題
+            all_saved_custom = db_load_custom_questions()
+            page_questions = [
+                q for q in all_saved_custom
+                if q.get("pdf_name") == chosen_pdf_name and int(q.get("page_num", 0)) == page_num
+            ]
+            # 若資料庫中尚未有該頁解析，即時解析本頁
+            if not page_questions:
+                page_questions = parse_all_questions_from_pdf(pdf_bytes, chosen_pdf_name, target_page=page_num - 1)
+                if page_questions:
+                    db_save_custom_questions(page_questions, pdf_name=chosen_pdf_name, page_num=page_num)
+
+            # 提供「快速新增本頁看圖連連看 / 填代號 / 勾選題」工具（針對純圖片無文字的圖表題）
+            with st.expander("➕ 新增／補充本頁看圖題（連連看、填代號、打勾題）並永久存檔"):
+                add_type = st.selectbox("選擇要補充的本頁題型", ["填充與代號題", "連連看", "勾選題", "是非題", "選擇題"], key="add_t")
+                add_q_title = st.text_input("題目說明", value=f"第 {page_num} 頁・做一做看圖題", key="add_title")
+
+                if add_type == "填充與代號題":
+                    st.caption("每行輸入一格：`小題標籤:正確答案`（例如 `(1)葉片部位:C` 或 `①號磁鐵極性:S`）")
+                    raw_blanks = st.text_area("輸入各小格設定", value="(1) 第1格答案:A\n(2) 第2格答案:B", key="add_blanks")
+                    if st.button("💾 儲存此題到本頁作答區", key="save_fill"):
+                        blanks_list = []
+                        for line in raw_blanks.strip().split("\n"):
+                            if ":" in line or "：" in line:
+                                parts = re.split(r'[:：]', line, maxsplit=1)
+                                blanks_list.append({"label": parts[0].strip(), "options": None, "ans": parts[1].strip()})
+                        if blanks_list:
+                            new_q = {
+                                "unit": f"考卷：{chosen_pdf_name} (第{page_num}頁)",
+                                "pdf_name": chosen_pdf_name,
+                                "page_num": page_num,
+                                "type": "填充與代號題",
+                                "q": add_q_title,
+                                "blanks": blanks_list,
+                                "exp": f"{chosen_pdf_name} 第 {page_num} 頁自訂看圖填充題"
+                            }
+                            db_save_custom_questions([new_q], pdf_name=chosen_pdf_name, page_num=page_num)
+                            st.success("已儲存！")
+                            st.rerun()
+
+                elif add_type == "連連看":
+                    st.caption("每行輸入一組正確配對：`左邊項目=右邊項目`（例如 `(1)朱槿=互生`）")
+                    raw_pairs = st.text_area("輸入連連看配對", value="(1) 項目1=目標A\n(2) 項目2=目標B", key="add_match")
+                    if st.button("💾 儲存此連連看到本頁作答區", key="save_match"):
+                        l_list, r_list, ans_map = [], [], {}
+                        for line in raw_pairs.strip().split("\n"):
+                            if "=" in line:
+                                l_str, r_str = [x.strip() for x in line.split("=", 1)]
+                                l_list.append(l_str)
+                                if r_str not in r_list:
+                                    r_list.append(r_str)
+                                ans_map[l_str] = r_str
+                        if l_list:
+                            new_q = {
+                                "unit": f"考卷：{chosen_pdf_name} (第{page_num}頁)",
+                                "pdf_name": chosen_pdf_name,
+                                "page_num": page_num,
+                                "type": "連連看",
+                                "q": add_q_title,
+                                "left_items": l_list,
+                                "right_items": r_list,
+                                "ans": ans_map,
+                                "exp": f"{chosen_pdf_name} 第 {page_num} 頁看圖連連看"
+                            }
+                            db_save_custom_questions([new_q], pdf_name=chosen_pdf_name, page_num=page_num)
+                            st.success("已儲存！")
+                            st.rerun()
+
+                elif add_type == "勾選題":
+                    raw_opts = st.text_input("所有選項（用逗號分隔）", value="(1)選項1, (2)選項2, (3)選項3, (4)選項4", key="add_chk_opts")
+                    raw_ans = st.text_input("應打 √ 的正確選項（用逗號分隔）", value="(1)選項1, (3)選項3", key="add_chk_ans")
+                    if st.button("💾 儲存此勾選題到本頁作答區", key="save_chk"):
+                        opts_l = [x.strip() for x in re.split(r'[,，]', raw_opts) if x.strip()]
+                        ans_l = [x.strip() for x in re.split(r'[,，]', raw_ans) if x.strip()]
+                        new_q = {
+                            "unit": f"考卷：{chosen_pdf_name} (第{page_num}頁)",
+                            "pdf_name": chosen_pdf_name,
+                            "page_num": page_num,
+                            "type": "勾選題",
+                            "q": add_q_title,
+                            "options": opts_l,
+                            "ans": ans_l,
+                            "exp": f"{chosen_pdf_name} 第 {page_num} 頁打√勾選題"
+                        }
+                        db_save_custom_questions([new_q], pdf_name=chosen_pdf_name, page_num=page_num)
+                        st.success("已儲存！")
+                        st.rerun()
+
+            if not page_questions:
+                st.info("📌 本頁為純課文或純圖片頁。若本頁有看圖連連看或填代號題，可點開上方「➕ 新增／補充本頁看圖題」加入作答框！")
+            else:
+                form_prefix = f"pdf_{hashlib.md5(chosen_pdf_name.encode()).hexdigest()[:6]}_p{page_num}"
+                for idx, q_item in enumerate(page_questions):
+                    render_interactive_question(idx, q_item, form_prefix=form_prefix)
+                    st.divider()
+
+                if st.button("🎯 送出本頁答案並自動批改", type="primary", use_container_width=True, key=f"grade_btn_{form_prefix}"):
+                    c_cnt = 0
+                    t_cnt = len(page_questions)
+                    for idx, q_item in enumerate(page_questions):
+                        is_ok, u_str, c_str = grade_interactive_question(idx, q_item, form_prefix=form_prefix)
+                        if is_ok:
+                            c_cnt += 1
+                            st.success(f"✔️ **第 {idx+1} 題答對！** 你的答案：`{u_str}`")
+                        else:
+                            st.error(f"❌ **第 {idx+1} 題答錯（已存入錯題本）！**\n- 你的答案：`{u_str}`\n- 🎯 **正確答案：`{c_str}`**")
+                            db_add_wrong_question(q_item, u_str)
+
+                    page_score = round((c_cnt / t_cnt) * 100)
+                    db_save_exam_history(f"{chosen_pdf_name} 第{page_num}頁", page_score, c_cnt, t_cnt)
+                    st.metric("🏆 本頁得分", f"{page_score} 分", f"答對 {c_cnt} / {t_cnt} 題")
+                    if page_score == 100:
+                        st.balloons()
+
+
+# ==========================================
+# 模式 4：錯題複習本（可直接重測消除錯題）＆ 永久備份管理
+# ==========================================
+elif mode == "❌ 錯題複習本＆永久備份管理":
+    st.header("❌ 專屬錯題複習本 ＆ 永久資料庫管理")
+
+    tab_wrong, tab_history, tab_backup = st.tabs([
+        "📕 錯題本直接重測（答對自動移除）",
+        "📈 歷史測驗成績紀錄",
+        "💾 題庫與錯題永久備份檔 (匯出/匯入)"
+    ])
+
+    with tab_wrong:
+        wrong_qs = db_load_wrong_questions()
+        if not wrong_qs:
+            st.success("🎉 太棒了！目前錯題本是空的，所有題目都已經精通囉！")
+        else:
+            st.warning(f"📌 目前共有 **{len(wrong_qs)}** 題錯題（已自動儲存在 SQLite 資料庫中，關閉網頁不會消失）。你可以直接在下方重新作答，答對即可消除錯題！")
+
+            if st.button("🗑️ 一鍵清空全部錯題紀錄"):
+                db_clear_all_wrong_questions()
+                st.rerun()
+
+            st.divider()
+            for idx, wq in enumerate(wrong_qs):
+                st.caption(f"📕 累計答錯 `{wq.get('_wrong_count', 1)}` 次 ｜ 上次錯誤作答：`{wq.get('_last_ans', '')}` ｜ 紀錄時間：{wq.get('_updated_at', '')}")
+                render_interactive_question(idx, wq, form_prefix="wrong_retry")
+                c_check, c_del = st.columns([2, 1])
+                with c_check:
+                    if st.button(f"✅ 批改第 {idx+1} 題錯題", key=f"retry_btn_{idx}", type="primary", use_container_width=True):
+                        is_ok, u_str, c_str = grade_interactive_question(idx, wq, form_prefix="wrong_retry")
+                        if is_ok:
+                            st.success(f"🎉 太棒了！第 {idx+1} 題答對了：`{u_str}`！已從錯題本移除！")
+                            db_remove_wrong_question(wq["_qid"])
+                            st.rerun()
+                        else:
+                            st.error(f"❌ 還是有誤喔！你的作答：`{u_str}` ｜ 🎯 正確答案：`{c_str}`\n\n💡 解析：{clean_cite(wq.get('exp',''))}")
+                with c_del:
+                    if st.button(f"🗑️ 手動移除此題", key=f"del_wq_{idx}", use_container_width=True):
+                        db_remove_wrong_question(wq["_qid"])
+                        st.rerun()
+                st.divider()
+
+    with tab_history:
+        history_list = db_load_exam_history()
+        if not history_list:
+            st.info("尚無測驗紀錄，快去題庫闖關或考卷作答試試看吧！")
+        else:
+            render_html_table(
+                ["測驗名稱", "分數", "答對題數", "測驗時間"],
+                [[h["測驗名稱"], h["分數"], h["答對題數"], h["測驗時間"]] for h in history_list]
+            )
+
+    with tab_backup:
+        st.subheader("📦 完整學習資料一鍵備份／還原")
+        st.markdown("雖然系統已內建 **SQLite 硬碟資料庫**（重整網頁或關機重開都不會消失），但若將來重新部署 GitHub / Streamlit Cloud 伺服器，可透過下方按鈕下載完整備份檔隨時還原：")
+
+        backup_payload = {
+            "custom_questions": db_load_custom_questions(),
+            "wrong_questions": db_load_wrong_questions(),
+            "exam_history": db_load_exam_history()
+        }
+        backup_json_str = json.dumps(backup_payload, ensure_ascii=False, indent=2)
+
         st.download_button(
-            label="⬇️ 下載目前完整題庫 (quiz_bank.json)",
-            data=json_str.encode("utf-8"),
-            file_name="kanghsuan_g3_science_quiz_bank.json",
+            label="⬇️ 下載完整題庫＋錯題本＋成績備份檔 (.json)",
+            data=backup_json_str.encode("utf-8"),
+            file_name="science_3a_full_backup.json",
             mime="application/json",
-            use_container_width=True
+            use_container_width=True,
+            type="primary"
         )
 
         st.divider()
-        st.subheader("📥 匯入 JSON 題庫備份")
-        uploaded_json = st.file_uploader("上傳先前備份的 .json 題庫檔", type=["json"])
-        if uploaded_json is not None:
-            loaded_data = json.load(uploaded_json)
-            if isinstance(loaded_data, list):
-                st.session_state.quiz_bank = loaded_data
-                st.success(f"已成功載入 {len(loaded_data)} 題題庫！")
+        uploaded_backup = st.file_uploader("📥 上傳先前下載的 .json 備份檔進行還原", type=["json"])
+        if uploaded_backup is not None:
+            data = json.load(uploaded_backup)
+            if "custom_questions" in data:
+                db_save_custom_questions(data["custom_questions"])
+            if "wrong_questions" in data:
+                for wq in data["wrong_questions"]:
+                    db_add_wrong_question(wq, wq.get("_last_ans", "備份還原"))
+            st.success("🎉 備份資料已成功寫入永久資料庫！")
+            st.rerun()
