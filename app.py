@@ -21,11 +21,55 @@ st.set_page_config(
 )
 
 DB_PATH = "science_persistent_store.db"
-PARSER_VERSION = "3.5"  # 版本升級時會自動重新解析已存檔的 PDF 考卷，補齊所有做一做與連連看
+PARSER_VERSION = "3.6"  # 自動升級已存檔 PDF 的解析版本號
 
 
 # ==========================================
-# 1. SQLite 永久儲存資料庫引擎
+# 1. 基礎文字清理工具函式（置頂定義，避免 NameError）
+# ==========================================
+def clean_cite(text: str) -> str:
+    """移除來源標記字串以維持畫面整潔"""
+    return re.sub(r'\s*\[cite:\s*[\d,\s]+\]', '', str(text))
+
+
+def clean_pdf_text(raw_text: str) -> str:
+    """清除康軒 PDF 內嵌注音符號與浮水印雜訊"""
+    if not raw_text:
+        return ""
+    cleaned = re.sub(r'(?<=[\u4e00-\u9fff])[\u3105-\u3129\u02CA\u02C7\u02CB\u02D9ˊˇˋ˙]+', '', str(raw_text))
+    cleaned = re.sub(r'xyz88\.\w+', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'有著作權.*?必究\s*\d*', '', cleaned)
+    return cleaned
+
+
+def render_masked_text(text: str, hide_keywords: bool) -> str:
+    """將 【關鍵字】 轉換為重點標示或遮罩填空"""
+    text = clean_cite(text)
+    if hide_keywords:
+        return re.sub(r'【(.*?)】', r'<span class="hidden-word">＿＿＿＿</span>', text)
+    else:
+        return re.sub(r'【(.*?)】', r'<span class="mask-word">\1</span>', text)
+
+
+def render_html_table(columns: list, rows: list, hide_kw: bool = False):
+    html = '<div style="overflow-x:auto;"><table class="custom-table"><thead><tr>'
+    for col in columns:
+        html += f"<th>{clean_cite(col)}</th>"
+    html += "</tr></thead><tbody>"
+    for r in rows:
+        html += "<tr>"
+        for idx, cell in enumerate(r):
+            c_str = clean_cite(cell)
+            if hide_kw and idx > 0:
+                c_str = '<span class="hidden-word">＿＿＿＿＿＿＿＿</span>'
+            html += f"<td>{c_str}</td>"
+        html += "</tr>"
+    html += "</tbody></table></div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# ==========================================
+# 2. SQLite 永久儲存資料庫引擎
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -52,7 +96,6 @@ def init_db():
             q_json TEXT
         )
     """)
-    # 相容舊版資料庫欄位檢查
     c.execute("PRAGMA table_info(custom_questions)")
     cols = [r[1] for r in c.fetchall()]
     if "seq_order" not in cols:
@@ -230,7 +273,7 @@ init_db()
 
 
 # ==========================================
-# 2. 動態大字體與 RWD 自適應樣式注入
+# 3. 動態大字體與 RWD 自適應樣式注入
 # ==========================================
 def apply_responsive_css(scale_pct: int):
     base_rem = round(scale_pct / 100.0, 2)
@@ -377,37 +420,8 @@ def apply_responsive_css(scale_pct: int):
     """, unsafe_allow_html=True)
 
 
-def clean_cite(text: str) -> str:
-    return re.sub(r'\s*\[cite:\s*[\d,\s]+\]', '', str(text))
-
-
-def render_masked_text(text: str, hide_keywords: bool) -> str:
-    text = clean_cite(text)
-    if hide_keywords:
-        return re.sub(r'【(.*?)】', r'<span class="hidden-word">＿＿＿＿</span>', text)
-    else:
-        return re.sub(r'【(.*?)】', r'<span class="mask-word">\1</span>', text)
-
-
-def render_html_table(columns: list, rows: list, hide_kw: bool = False):
-    html = '<div style="overflow-x:auto;"><table class="custom-table"><thead><tr>'
-    for col in columns:
-        html += f"<th>{clean_cite(col)}</th>"
-    html += "</tr></thead><tbody>"
-    for r in rows:
-        html += "<tr>"
-        for idx, cell in enumerate(r):
-            c_str = clean_cite(cell)
-            if hide_kw and idx > 0:
-                c_str = '<span class="hidden-word">＿＿＿＿＿＿＿＿</span>'
-            html += f"<td>{c_str}</td>"
-        html += "</tr>"
-    html += "</tbody></table></div>"
-    st.markdown(html, unsafe_allow_html=True)
-
-
 # ==========================================
-# 3. 升級版連連看 SVG 畫線與完整解答修正顯示元件
+# 4. 升級版連連看 SVG 畫線與完整解答修正顯示元件
 # ==========================================
 def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, correct_pairs: dict = None, show_grading: bool = False):
     """
@@ -425,7 +439,6 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
 
     svg_elements = []
 
-    # 1. 先畫連線（放在方框底層或端點之間）
     if not show_grading:
         for i, l_text in enumerate(left_items):
             chosen_r = user_pairs.get(l_text)
@@ -438,8 +451,8 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
                     f'<line x1="280" y1="{y1}" x2="470" y2="{y2}" stroke="{stroke_col}" stroke-width="4.5" stroke-linecap="round"/>'
                 )
     else:
-        # 批改模式：先畫出使用者連錯的「紅色虛線」
         if correct_pairs:
+            # 先畫出使用者連錯的「紅色虛線」
             for i, l_text in enumerate(left_items):
                 chosen_r = user_pairs.get(l_text)
                 corr_r = correct_pairs.get(l_text)
@@ -450,7 +463,7 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
                     svg_elements.append(
                         f'<line x1="280" y1="{y1}" x2="470" y2="{y2}" stroke="#dc2626" stroke-width="3.5" stroke-dasharray="8,6" opacity="0.85" stroke-linecap="round"/>'
                     )
-            # 再畫出所有「完整正確解答的綠色實線」
+            # 再畫出所有「完整正確解答的綠色粗實線」
             for i, l_text in enumerate(left_items):
                 corr_r = correct_pairs.get(l_text)
                 if corr_r and corr_r in right_items:
@@ -461,7 +474,6 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
                         f'<line x1="280" y1="{y1}" x2="470" y2="{y2}" stroke="#16a34a" stroke-width="5" stroke-linecap="round"/>'
                     )
 
-    # 2. 左側項目方框
     for i, l_text in enumerate(left_items):
         cy = 40 + i * row_h
         l_clean = clean_cite(l_text)
@@ -480,7 +492,6 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
             f'<circle cx="280" cy="{cy}" r="6.5" fill="{box_stroke}"/>'
         )
 
-    # 3. 右側項目方框
     for j, r_text in enumerate(right_items):
         cy = 40 + j * row_h
         r_clean = clean_cite(r_text)
@@ -493,7 +504,7 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
     legend_html = ""
     if show_grading:
         legend_html = (
-            '<div style="padding:6px 12px; background:#f8fafc; border-bottom:1px solid #e2e8f0; font-weight:700; font-size:0.95rem;">'
+            '<div style="padding:8px 14px; background:#f8fafc; border-bottom:1px solid #e2e8f0; font-weight:700; font-size:0.95rem;">'
             '🟢 <span style="color:#16a34a;">綠色實線：正確完整解答連線</span> &nbsp;｜&nbsp; '
             '🔴 <span style="color:#dc2626;">紅色虛線：你連錯的線</span>'
             '</div>'
@@ -511,7 +522,6 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
     """
     st.markdown(svg_html, unsafe_allow_html=True)
 
-    # 批改後額外輸出清晰完整的「訂正對照表」
     if show_grading and correct_pairs:
         rows = []
         for l_text in left_items:
@@ -528,7 +538,7 @@ def render_svg_matching(left_items: list, right_items: list, user_pairs: dict, c
 
 
 # ==========================================
-# 4. 第一份《重點複習》100% 完整資料庫
+# 5. 第一份《重點複習》100% 完整資料庫
 # ==========================================
 COMPLETE_REVIEW_DATA = {
     "單元1：多采多姿的植物": {
@@ -884,7 +894,7 @@ COMPLETE_REVIEW_DATA = {
                         "columns": ["材料名稱", "用眼睛看（外觀）", "用手觸摸（觸感）", "搓聞有無氣味", "能否完全溶於水", "水溶液酸鹼性"],
                         "rows": [
                             ["砂糖", "黃色（或白色）、顆粒狀", "粗粗的", "有（甜甜氣味）", "能（完全溶解）", "中性[cite: 47, 48, 54, 95]"],
-                            ["食鹽", "白色、顆粒狀", "粗粗的", "無", "能（完全溶解）", "中性[cite: 47, 48, 54]"],
+                            ["食鹽", "白色、顆粒狀", "粗粗的", "xxx 無", "能（完全溶解）", "中性[cite: 47, 48, 54]".replace("xxx ", "")],
                             ["小蘇打粉", "白色、粉末狀", "細細的", "無", "能（完全溶解）", "鹼性[cite: 47, 48, 54]"],
                             ["黑胡椒粒", "深棕色、顆粒狀", "粗粗的", "有（辛辣氣味）", "不能（有顆粒沉澱）", "無法判別[cite: 47, 48, 56, 95]"],
                             ["檸檬酸", "白色、顆粒狀", "粗粗的", "無", "能（完全溶解）", "酸性[cite: 47, 48, 54]"]
@@ -986,7 +996,7 @@ COMPLETE_REVIEW_DATA = {
 
 
 # ==========================================
-# 5. 內建全題型精選題庫（是非、選擇、連連看、填充代號、勾選題）
+# 6. 內建全題型精選題庫（是非、選擇、連連看、填充代號、勾選題）
 # ==========================================
 DEFAULT_QUIZ_BANK = [
     {
@@ -1083,7 +1093,7 @@ DEFAULT_QUIZ_BANK = [
     {
         "unit": "單元1：多采多姿的植物",
         "type": "填充與代號題",
-        "q": "【做一做・果實傳播與力的三要素、葉脈分類】請填入或選擇正確答案：",
+        "q": "【做一做・果實傳播與力的三要素】請填入或選擇正確答案：",
         "blanks": [
             {"label": "1.(1) 果實除了能吸引動物採食、幫助傳播種子外，還有什麼功能？", "options": ["保護種子", "製造養分", "吸收水分"], "ans": "保護種子"},
             {"label": "1.(2) 龍葵的果實傳播方式代號（甲.隨風飄揚傳播 / 乙.吸引動物採食傳播）：", "options": ["甲. 隨風飄揚傳播", "乙. 吸引動物採食傳播"], "ans": "乙"},
@@ -1112,12 +1122,11 @@ DEFAULT_QUIZ_BANK = [
 
 
 # ==========================================
-# 6. 考卷頁面「做一做／連連看／填空／素養題」精準配對庫 + 深度通用解析器
+# 7. 考卷頁面「做一做／連連看／填空／素養題」精準配對庫 + 深度通用解析器
 # ==========================================
 def get_page_specific_exercises(page_text: str, unit_label: str, source_name: str, page_num: int) -> list:
     """
-    針對考卷（01~08 月考/期中考卷、校用卷、重點複習）各頁面的「做一做」、「連連看」、「素養題」進行精準題型生成，
-    確保每一題填空、填代號、打√畫○、連連看都能在右側直接作答並自動批改！
+    針對重點複習、校用素養評量單、01~08 月考/期中考卷各頁面的「做一做」、「連連看」、「素養題」進行精準題型生成
     """
     extra_qs = []
 
@@ -1129,7 +1138,7 @@ def get_page_specific_exercises(page_text: str, unit_label: str, source_name: st
                 "type": "填充與代號題",
                 "q": "【3 做一做】第 1 題：植物果實的功能與傳播方式配對",
                 "blanks": [
-                    {"label": "(1) 果實除了能吸引動物採食，幫助傳播種子之外，還有什麼功能呢？（可選填或輸入：保護種子）", "options": ["保護種子", "製造養分", "吸收水分"], "ans": "保護種子"},
+                    {"label": "(1) 果實除了能吸引動物採食，幫助傳播種子之外，還有什麼功能呢？", "options": ["保護種子", "製造養分", "吸收水分"], "ans": "保護種子"},
                     {"label": "(2)-1 【龍葵】的果實傳播方式代號（甲.隨風飄揚傳播 / 乙.吸引動物採食傳播）：", "options": ["甲. 隨風飄揚傳播", "乙. 吸引動物採食傳播"], "ans": "乙"},
                     {"label": "(2)-2 【臺灣欒樹】的果實傳播方式代號：", "options": ["甲. 隨風飄揚傳播", "乙. 吸引動物採食傳播"], "ans": "甲"},
                     {"label": "(2)-3 【蘋果】的果實傳播方式代號：", "options": ["甲. 隨風飄揚傳播", "乙. 吸引動物採食傳播"], "ans": "乙"}
@@ -1223,7 +1232,7 @@ def get_page_specific_exercises(page_text: str, unit_label: str, source_name: st
                     {"label": "3.(4) 蒜：", "options": ["A. 軸根", "B. 鬚根"], "ans": "B"},
                     {"label": "3.(5) 莧菜：", "options": ["A. 軸根", "B. 鬚根"], "ans": "A"},
                     {"label": "3.(6) 稻子：", "options": ["A. 軸根", "B. 鬚根"], "ans": "B"},
-                    {"label": "4. 踢足球用力大小由大到小依序排列（格式如 B>C>A>D）：", "options": ["B>C>A>D", "A>B>C>D", "D>A>C>B"], "ans": "B>C>A>D"}
+                    {"label": "4. 踢足球用力大小由大到小依序排列：", "options": ["B>C>A>D", "A>B>C>D", "D>A>C>B"], "ans": "B>C>A>D"}
                 ],
                 "exp": "小白菜、菠菜、莧菜為軸根(A)；蔥、蒜、稻子為鬚根(B)。線段越長代表力越大，排序為 B > C > A > D[cite: 89]。"
             }
@@ -1269,7 +1278,7 @@ def get_page_specific_exercises(page_text: str, unit_label: str, source_name: st
                 "blanks": [
                     {"label": "1.(1) 磁吸式鉛筆盒（是磁力應用畫○，不是打×）：", "options": ["○", "×"], "ans": "○"},
                     {"label": "1.(2) 按下電燈開關：", "options": ["○", "×"], "ans": "×"},
-                    {"label": "1.(3) 磁吸式跳棋：", "options": ["○", "×",], "ans": "○"},
+                    {"label": "1.(3) 磁吸式跳棋：", "options": ["○", "×"], "ans": "○"},
                     {"label": "1.(4) 放風箏：", "options": ["○", "×"], "ans": "×"},
                     {"label": "2.(1) U形磁鐵（N對N、S對S，會吸住畫○，排斥打×）：", "options": ["○（吸住）", "×（排斥）"], "ans": "×"},
                     {"label": "2.(2) 圓形磁鐵（異極相對）：", "options": ["○（吸住）", "×（排斥）"], "ans": "○"},
@@ -1408,7 +1417,7 @@ def get_page_specific_exercises(page_text: str, unit_label: str, source_name: st
         ])
 
     # --- [08_期中考B卷 第2頁] ---
-    elif ("豔紫荊花" in page_text or "豔紫荆花" in page_text or ("組合2個磁鐵" in page_text)) or ("08_國小自然3上期中考B卷" in source_name and page_num == 2):
+    elif ("豔紫荊花" in page_text or "豔紫荆花" in page_text or "組合2個磁鐵" in page_text) or ("08_國小自然3上期中考B卷" in source_name and page_num == 2):
         extra_qs.extend([
             {
                 "unit": unit_label, "pdf_name": source_name, "page_num": page_num,
@@ -1432,6 +1441,57 @@ def get_page_specific_exercises(page_text: str, unit_label: str, source_name: st
             }
         ])
 
+    # --- [重點複習 單元3自我挑戰 連連看頁 (第44頁)] ---
+    elif "餅乾包裝" in page_text and "空氣槍玩具" in page_text and "玩風帆" in page_text:
+        extra_qs.append({
+            "unit": unit_label, "pdf_name": source_name, "page_num": page_num,
+            "type": "連連看",
+            "q": "【三、做一做】第 1 題：下列物品或活動分別應用了空氣的什麼特性？請連一連",
+            "left_items": ["① 餅乾包裝", "② 放風箏", "③ 空氣槍玩具", "④ 玩風帆"],
+            "right_items": ["A. 空氣占有空間", "B. 空氣可以被壓縮", "C. 空氣流動形成風"],
+            "ans": {
+                "① 餅乾包裝": "A. 空氣占有空間",
+                "② 放風箏": "C. 空氣流動形成風",
+                "③ 空氣槍玩具": "B. 空氣可以被壓縮",
+                "④ 玩風帆": "C. 空氣流動形成風"
+            },
+            "exp": "餅乾包裝應用空氣占有空間(A)；空氣槍玩具應用空氣可以被壓縮(B)；放風箏與玩風帆應用空氣流動形成風(C)[cite: 44]。"
+        })
+
+    # --- [校用卷 第14頁 (13-1) 力的種類連連看] ---
+    elif "輪船在海上" in page_text and "跳棋吸在鐵" in page_text and "浩恩" in page_text:
+        extra_qs.append({
+            "unit": unit_label, "pdf_name": source_name, "page_num": page_num,
+            "type": "連連看",
+            "q": "【三、做一做】第 3 題：生活中有許多不同種類的力，下列圖片中分別是利用什麼力？請連一連",
+            "left_items": ["(1) 輪船在海上航行", "(2) 風箏在空中飛", "(3) 原子筆筆心縮回", "(4) 跳棋吸在鐵製棋盤上"],
+            "right_items": ["甲. 磁力", "乙. 水的浮力", "丙. 風力", "丁. 彈力"],
+            "ans": {
+                "(1) 輪船在海上航行": "乙. 水的浮力",
+                "(2) 風箏在空中飛": "丙. 風力",
+                "(3) 原子筆筆心縮回": "丁. 彈力",
+                "(4) 跳棋吸在鐵製棋盤上": "甲. 磁力"
+            },
+            "exp": "輪船利用水的浮力(乙)；風箏利用風力(丙)；原子筆利用彈力(丁)；跳棋利用磁力(甲)[cite: 77]。"
+        })
+
+    # --- [校用卷 第22頁 (17-1) 紫色高麗菜汁顏色連連看] ---
+    elif "燕妮" in page_text and "小恩在廚房幫助媽媽" in page_text:
+        extra_qs.append({
+            "unit": unit_label, "pdf_name": source_name, "page_num": page_num,
+            "type": "連連看",
+            "q": "【三、做一做】第 3 題：將小蘇打粉、食鹽、醋、檸檬酸製成水溶液，分別加入紫色高麗菜汁後會呈現什麼顏色？請連出正確答案",
+            "left_items": ["(1) 小蘇打粉", "(2) 食鹽", "(3) 醋", "(4) 檸檬酸"],
+            "right_items": ["甲. 紫色", "乙. 偏紅色", "丙. 偏藍綠色"],
+            "ans": {
+                "(1) 小蘇打粉": "丙. 偏藍綠色",
+                "(2) 食鹽": "甲. 紫色",
+                "(3) 醋": "乙. 偏紅色",
+                "(4) 檸檬酸": "乙. 偏紅色"
+            },
+            "exp": "小蘇打水呈偏藍綠色(丙)；食鹽水維持紫色(甲)；醋與檸檬酸水呈偏紅色(乙)[cite: 85]。"
+        })
+
     return extra_qs
 
 
@@ -1439,9 +1499,9 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
     """
     全方位解析 PDF 考卷中的：
     1. 是非題 (○ / ×)
-    2. 選擇題 (修正第4選項截斷問題)
-    3. 頁面精準做一做題組 (填空、代號配對、打√畫○、連連看)
-    4. 通用規則解析做一做與素養題（支援未知新考卷自動抓取）
+    2. 選擇題 (完整擷取4個選項不截斷)
+    3. 頁面專屬做一做題組 (填空、代號配對、打√畫○、連連看)
+    4. 通用規則解析做一做與素養題
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     parsed_list = []
@@ -1477,7 +1537,7 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
                 "exp": f"來源：{source_name} 第 {page_idx+1} 頁"
             })
 
-        # 2. 解析選擇題 (修正第4選項貪婪匹配，避免『④長春花』被截成『④長』)
+        # 2. 解析選擇題 (完整擷取第 4 個選項)
         mc_pattern = re.compile(
             r'[\(（]\s*([①②③④1234]?)\s*[\)）]\s*(\d+|\(\d+\))\s*[\.、]?\s*([^①②③④\(（]{4,120}?[？\?：:])\s*'
             r'[①1]\s*([^②③④]+?)\s*[②2]\s*([^③④]+?)\s*[③3]\s*([^④]+?)\s*[④4]\s*([^\n。；①②③④\(（]{1,35})'
@@ -1489,7 +1549,6 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
             o2 = re.sub(r'\s+', '', opt2).rstrip('。')
             o3 = re.sub(r'\s+', '', opt3).rstrip('。')
             o4 = re.sub(r'\s+', '', opt4).rstrip('。')
-            # 清理第4選項可能連帶抓到的下一大題標題
             o4 = re.split(r'(?:三、|四、|3做一做|做一做|素養題)', o4)[0].strip()
             opts = [f"①{o1}", f"②{o2}", f"③{o3}", f"④{o4}"]
             ans_map = {"①": opts[0], "1": opts[0], "②": opts[1], "2": opts[1], "③": opts[2], "3": opts[2], "④": opts[3], "4": opts[3]}
@@ -1510,8 +1569,7 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
         if specific_qs:
             parsed_list.extend(specific_qs)
         else:
-            # 4. 若為其他頁面（如校用卷、重點複習自我挑戰），執行通用深度「做一做＆素養題」解析器
-            # (A) 通用解析：做一做內的括號代號/打勾畫圈題，例如 (√)①小白菜 (○)②蒜 或 (A)(1)樟樹
+            # 4. 通用深度「做一做＆素養題」解析器
             sub_code_pattern = re.compile(r'[\(（]\s*([√✓○◯×X✕△A-F甲乙丙丁ㄅㄆㄇㄈ])\s*[\)）]\s*([①②③④⑤⑥\(\d\)\d\.、\s]*[\u4e00-\u9fff]{1,12})')
             sub_matches = list(sub_code_pattern.finditer(joined_text))
             if len(sub_matches) >= 2:
@@ -1519,7 +1577,6 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
                 for sm in sub_matches:
                     ans_sym, item_lbl = sm.groups()
                     item_lbl_clean = re.sub(r'\s+', '', item_lbl)
-                    # 過濾一般是非題長句
                     if len(item_lbl_clean) > 12 or len(item_lbl_clean) < 1:
                         continue
                     ans_norm = "√" if ans_sym in ["√", "✓"] else ("○" if ans_sym in ["○", "◯"] else ("×" if ans_sym in ["×", "X", "✕"] else ans_sym))
@@ -1539,7 +1596,6 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
                         "exp": f"來源：{source_name} 第 {page_idx+1} 頁做一做配對"
                     })
 
-            # (B) 通用解析：句子中間的括號填空題，例如：屬於(藤本)莖、應為(S)極、最多可以完全溶解(3)平匙
             inline_fill_pattern = re.compile(r'([\u4e00-\u9fff0-9A-Za-z，、]{3,25}?[\(（]\s*([A-DSNsN甲乙丙丁藤本磁極快慢345813不可以作用點方向大小長短]+)\s*[\)）][\u4e00-\u9fff]{0,10})')
             inline_blanks = []
             for im in inline_fill_pattern.finditer(joined_text):
@@ -1562,10 +1618,8 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
                     "exp": f"來源：{source_name} 第 {page_idx+1} 頁填充題"
                 })
 
-            # (C) 通用解析：在 □ 中打 √ 的勾選題，例如 √①吸引動物採食 √②幫助傳播花粉 ③幫助吸收水分
             chk_pattern = re.compile(r'([√✓]?)\s*([①②③④⑤⑥]|\(\d\))\s*([\u4e00-\u9fff]{2,18})')
             if "打√" in joined_text or "打" in joined_text:
-                # 尋找做一做區段之後的勾選項
                 do_sec_split = re.split(r'(?:三、做一做|3做一做|做一做|四、素養題)', joined_text)
                 if len(do_sec_split) > 1:
                     tail_text = " ".join(do_sec_split[1:])
@@ -1595,21 +1649,24 @@ def parse_all_questions_from_pdf(pdf_bytes: bytes, source_name: str, target_page
 
 
 def ensure_db_questions_upgraded():
-    """當 PARSER_VERSION 更新時，自動將 SQLite 內已儲存的 PDF 重新深度解析，確保做一做與連連看全部出現"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT val FROM meta_info WHERE key = 'parser_version'")
-    row = c.fetchone()
-    current_ver = row[0] if row else ""
+    """當 PARSER_VERSION 更新時，自動將 SQLite 內已儲存的 PDF 重新深度解析，並加上防呆保護"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT val FROM meta_info WHERE key = 'parser_version'")
+        row = c.fetchone()
+        current_ver = row[0] if row else ""
 
-    if current_ver != PARSER_VERSION:
-        pdfs = db_load_all_pdfs()
-        for fname, fbytes in pdfs.items():
-            upgraded_qs = parse_all_questions_from_pdf(fbytes, fname)
-            db_replace_pdf_questions(fname, upgraded_qs)
-        c.execute("INSERT OR REPLACE INTO meta_info (key, val) VALUES ('parser_version', ?)", (PARSER_VERSION,))
-        conn.commit()
-    conn.close()
+        if current_ver != PARSER_VERSION:
+            pdfs = db_load_all_pdfs()
+            for fname, fbytes in pdfs.items():
+                upgraded_qs = parse_all_questions_from_pdf(fbytes, fname)
+                db_replace_pdf_questions(fname, upgraded_qs)
+            c.execute("INSERT OR REPLACE INTO meta_info (key, val) VALUES ('parser_version', ?)", (PARSER_VERSION,))
+            conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 ensure_db_questions_upgraded()
@@ -1634,7 +1691,7 @@ def render_pdf_page_image(pdf_bytes: bytes, page_num: int, hide_answers: bool = 
 
 
 # ==========================================
-# 7. 互動題目渲染與自動批改核心函數
+# 8. 互動題目渲染與自動批改核心函數
 # ==========================================
 def render_interactive_question(idx: int, item: dict, form_prefix: str):
     """渲染單一題目（支援是非、選擇、勾選、填充代號、連連看）"""
@@ -1731,7 +1788,6 @@ def grade_interactive_question(idx: int, item: dict, form_prefix: str) -> tuple:
             raw_val = st.session_state.get(f"{form_prefix}_q_{idx}_blank_{b_i}", "")
             u_val = "" if raw_val == "-- 請選擇答案 --" else str(raw_val).strip()
             ans_val = str(b_item["ans"]).strip()
-            # 智慧比對：完全相同，或標準代號/關鍵詞包含於所選項目中
             sub_ok = (
                 (u_val.upper() == ans_val.upper())
                 or (u_val != "" and (ans_val in u_val or u_val in ans_val))
@@ -1762,7 +1818,6 @@ def grade_interactive_question(idx: int, item: dict, form_prefix: str) -> tuple:
             u_parts.append(f"{l_text}➔{u_val if u_val else '未連'}{'✔️' if sub_ok else f'❌(應連:{exp_val})'}")
             c_parts.append(f"{l_text}➔{exp_val}")
 
-        # 繪製帶有所有正確綠色實線 + 完整訂正對照表的 SVG
         st.markdown(f"##### 🎯 第 {idx+1} 題【連連看完整解答修正圖】")
         render_svg_matching(left_items, right_items, user_map, correct_pairs=expected_map, show_grading=True)
         return all_ok, " ； ".join(u_parts), " ； ".join(c_parts)
@@ -1771,7 +1826,7 @@ def grade_interactive_question(idx: int, item: dict, form_prefix: str) -> tuple:
 
 
 # ==========================================
-# 8. 側邊欄導覽與字體縮放控制
+# 9. 側邊欄導覽與字體縮放控制
 # ==========================================
 with st.sidebar:
     st.title("🌿 小三自然複習神器")
@@ -1999,7 +2054,6 @@ elif mode == "📄 考卷 PDF 直接作答＆自動批改":
         with col_ans_sheet:
             st.subheader(f"✍️ 第 {page_num} 頁｜直接作答與自動批改區")
 
-            # 即時合併資料庫題目與本頁深度解析題目，確保「做一做」絕不遺漏
             fresh_page_qs = parse_all_questions_from_pdf(pdf_bytes, chosen_pdf_name, target_page=page_num - 1)
             all_saved_custom = db_load_custom_questions()
             saved_page_qs = [
